@@ -1,4 +1,5 @@
 import os
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import torch
@@ -7,7 +8,6 @@ import tqdm
 
 from ..basic.callback import EarlyStopper
 from ..basic.loss_func import RegularizationLoss
-from ..models.multi_task import ESMM
 from ..utils.data import get_loss_func, get_metric_func
 from ..utils.mtl import MetaBalance, gradnorm, shared_task_layers
 
@@ -29,6 +29,10 @@ class MTLTrainer(object):
         device (str): `"cpu"` or `"cuda:0"`
         gpus (list): id of multi gpu (default=[]). If the length >=1, then the model will wrapped by nn.DataParallel.
         model_path (str): the path you want to save the model (default="./"). Note only save the best weight in the validation data.
+        custom_loss_funcs (Sequence[Callable | None], optional): Per-task override hooks. Each callable
+            receives the full ``(preds, targets)`` tensors and replaces the corresponding task loss.
+        custom_evaluate_funcs (Sequence[Callable | None], optional): Per-task override hooks. Each callable
+            receives the full ``(targets, predicts)`` arrays and replaces the corresponding task metric.
     """
 
     def __init__(
@@ -48,6 +52,8 @@ class MTLTrainer(object):
         gpus=None,
         model_path="./",
         model_logger=None,
+        custom_loss_funcs: Optional[Sequence[Optional[Callable]]] = None,
+        custom_evaluate_funcs: Optional[Sequence[Optional[Callable]]] = None,
     ):
         self.model = model
         if gpus is None:
@@ -58,6 +64,12 @@ class MTLTrainer(object):
             regularization_params = {"embedding_l1": 0.0, "embedding_l2": 0.0, "dense_l1": 0.0, "dense_l2": 0.0}
         self.task_types = task_types
         self.n_task = len(task_types)
+        self.custom_loss_funcs = list(custom_loss_funcs or [])
+        self.custom_evaluate_funcs = list(custom_evaluate_funcs or [])
+        if len(self.custom_loss_funcs) > self.n_task:
+            raise ValueError(f"custom_loss_funcs expects at most {self.n_task} entries, got {len(self.custom_loss_funcs)}")
+        if len(self.custom_evaluate_funcs) > self.n_task:
+            raise ValueError(f"custom_evaluate_funcs expects at most {self.n_task} entries, got {len(self.custom_evaluate_funcs)}")
         self.loss_weight = None
         self.adaptive_method = None
         if adaptive_params is not None:
@@ -115,19 +127,8 @@ class MTLTrainer(object):
             x_dict = {k: v.to(self.device) for k, v in x_dict.items()}  # tensor to GPU
             ys = ys.to(self.device)
             y_preds = self.model(x_dict)
-            loss_list = [self.loss_fns[i](y_preds[:, i], ys[:, i].float()) for i in range(self.n_task)]
-            if isinstance(self.model, ESMM):
-                # ESSM only compute loss for ctr and ctcvr task
-                loss = sum(loss_list[1:])
-            else:
-                if self.adaptive_method is not None:
-                    if self.adaptive_method == "uwl":
-                        loss = 0
-                        for loss_i, w_i in zip(loss_list, self.loss_weight):
-                            w_i = torch.clamp(w_i, min=0)
-                            loss += 2 * loss_i * torch.exp(-w_i) + w_i
-                else:
-                    loss = sum(loss_list) / self.n_task
+            loss_list = self._compute_task_losses(y_preds, ys)
+            loss = self._aggregate_task_losses(loss_list)
 
             # Add regularization loss
             reg_loss = self.reg_loss_fn(self.model)
@@ -235,6 +236,60 @@ class MTLTrainer(object):
             return self.optimizer.param_groups[0]['lr']
         return None
 
+    def _base_model(self):
+        """Return the underlying model when wrapped by ``DataParallel``."""
+        return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
+    def _compute_task_losses(self, y_preds, ys):
+        """Resolve task losses from model hooks, then apply explicit overrides."""
+        ys = ys.float()
+        base_model = self._base_model()
+
+        if hasattr(base_model, "compute_task_losses"):
+            loss_list = list(base_model.compute_task_losses(y_preds, ys, default_loss_fns=self.loss_fns))
+        else:
+            loss_list = [self.loss_fns[i](y_preds[:, i], ys[:, i]) for i in range(self.n_task)]
+
+        if len(loss_list) != self.n_task:
+            raise ValueError(f"Expected {self.n_task} task losses, got {len(loss_list)}")
+
+        for i, loss_fn in enumerate(self.custom_loss_funcs):
+            if loss_fn is not None:
+                loss_list[i] = loss_fn(y_preds, ys)
+        return loss_list
+
+    def _aggregate_task_losses(self, loss_list):
+        """Aggregate task losses with model-specific hooks or adaptive weighting."""
+        base_model = self._base_model()
+        if hasattr(base_model, "aggregate_task_losses"):
+            return base_model.aggregate_task_losses(loss_list)
+
+        if self.adaptive_method is not None and self.adaptive_method == "uwl":
+            loss = 0
+            for loss_i, w_i in zip(loss_list, self.loss_weight):
+                w_i = torch.clamp(w_i, min=0)
+                loss += 2 * loss_i * torch.exp(-w_i) + w_i
+            return loss
+
+        return sum(loss_list) / self.n_task
+
+    def _compute_task_metrics(self, targets, predicts):
+        """Resolve task metrics from model hooks, then apply explicit overrides."""
+        base_model = self._base_model()
+
+        if hasattr(base_model, "compute_task_metrics"):
+            scores = list(base_model.compute_task_metrics(targets, predicts, default_metric_fns=self.evaluate_fns))
+        else:
+            scores = [self.evaluate_fns[i](targets[:, i], predicts[:, i]) for i in range(self.n_task)]
+
+        if len(scores) != self.n_task:
+            raise ValueError(f"Expected {self.n_task} task metrics, got {len(scores)}")
+
+        for i, evaluate_fn in enumerate(self.custom_evaluate_funcs):
+            if evaluate_fn is not None:
+                scores[i] = evaluate_fn(targets, predicts)
+        return scores
+
     def evaluate(self, model, data_loader):
         model.eval()
         targets, predicts = list(), list()
@@ -247,8 +302,7 @@ class MTLTrainer(object):
                 targets.extend(ys.tolist())
                 predicts.extend(y_preds.tolist())
         targets, predicts = np.array(targets), np.array(predicts)
-        scores = [self.evaluate_fns[i](targets[:, i], predicts[:, i]) for i in range(self.n_task)]
-        return scores
+        return self._compute_task_metrics(targets, predicts)
 
     def predict(self, model, data_loader):
         model.eval()
