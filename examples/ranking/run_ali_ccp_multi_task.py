@@ -2,6 +2,8 @@ import sys
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 
 from torch_rechub.basic.features import DenseFeature, SparseFeature
 from torch_rechub.models.multi_task import AITM, ESMM, MMOE, PLE, SharedBottom
@@ -9,6 +11,22 @@ from torch_rechub.trainers import MTLTrainer
 from torch_rechub.utils.data import DataGenerator
 
 sys.path.append("../..")
+
+
+def conditional_cvr_loss(preds, targets, task_id=0):
+    click_mask = targets[:, 1] == 1
+    if click_mask.any():
+        return F.binary_cross_entropy(preds[click_mask, task_id], targets[click_mask, task_id])
+    return preds[:, task_id].new_tensor(0.0)
+
+
+def conditional_cvr_auc(targets, preds, task_id=0):
+    click_mask = targets[:, 1] == 1
+    click_targets = targets[click_mask, task_id]
+    click_preds = preds[click_mask, task_id]
+    if len(click_targets) == 0 or len(set(click_targets.tolist())) < 2:
+        return float("nan")
+    return roc_auc_score(click_targets, click_preds)
 
 
 def get_ali_ccp_data_dict(model_name, data_path='./data/ali-ccp'):
@@ -82,7 +100,17 @@ def main(model_name, epoch, learning_rate, batch_size, weight_decay, device, sav
     # adaptive weight loss:
     # mtl_trainer = MTLTrainer(model, task_types=task_types, optimizer_params={"lr": learning_rate, "weight_decay": weight_decay}, adaptive_params={"method": "uwl"}, n_epoch=epoch, earlystop_patience=10, device=device, model_path=save_dir)
 
-    mtl_trainer = MTLTrainer(model, task_types=task_types, optimizer_params={"lr": learning_rate, "weight_decay": weight_decay}, n_epoch=epoch, earlystop_patience=30, device=device, model_path=save_dir)
+    mtl_trainer = MTLTrainer(
+        model,
+        task_types=task_types,
+        optimizer_params={"lr": learning_rate, "weight_decay": weight_decay},
+        n_epoch=epoch,
+        earlystop_patience=30,
+        device=device,
+        model_path=save_dir,
+        custom_loss_funcs=[conditional_cvr_loss],
+        custom_evaluate_funcs=[conditional_cvr_auc],
+    )
     mtl_trainer.fit(train_dataloader, val_dataloader)
     auc = mtl_trainer.evaluate(mtl_trainer.model, test_dataloader)
     print(f'test auc: {auc}')

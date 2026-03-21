@@ -1,3 +1,4 @@
+import inspect
 import os
 from typing import Callable, Optional, Sequence
 
@@ -8,6 +9,7 @@ import tqdm
 
 from ..basic.callback import EarlyStopper
 from ..basic.loss_func import RegularizationLoss
+from ..models.multi_task import ESMM
 from ..utils.data import get_loss_func, get_metric_func
 from ..utils.mtl import MetaBalance, gradnorm, shared_task_layers
 
@@ -30,9 +32,11 @@ class MTLTrainer(object):
         gpus (list): id of multi gpu (default=[]). If the length >=1, then the model will wrapped by nn.DataParallel.
         model_path (str): the path you want to save the model (default="./"). Note only save the best weight in the validation data.
         custom_loss_funcs (Sequence[Callable | None], optional): Per-task override hooks. Each callable
-            receives the full ``(preds, targets)`` tensors and replaces the corresponding task loss.
+            receives ``(preds, targets, task_id)`` or ``(preds, targets)`` and replaces the corresponding task loss.
         custom_evaluate_funcs (Sequence[Callable | None], optional): Per-task override hooks. Each callable
-            receives the full ``(targets, predicts)`` arrays and replaces the corresponding task metric.
+            receives ``(targets, predicts, task_id)`` or ``(targets, predicts)`` and replaces the corresponding task metric.
+        loss_aggregate_fn (Callable, optional): Custom reducer for task losses. Receives ``(loss_list, preds, targets)``
+            or ``(loss_list,)`` and returns the scalar loss used for backward.
     """
 
     def __init__(
@@ -54,6 +58,7 @@ class MTLTrainer(object):
         model_logger=None,
         custom_loss_funcs: Optional[Sequence[Optional[Callable]]] = None,
         custom_evaluate_funcs: Optional[Sequence[Optional[Callable]]] = None,
+        loss_aggregate_fn: Optional[Callable] = None,
     ):
         self.model = model
         if gpus is None:
@@ -66,6 +71,7 @@ class MTLTrainer(object):
         self.n_task = len(task_types)
         self.custom_loss_funcs = list(custom_loss_funcs or [])
         self.custom_evaluate_funcs = list(custom_evaluate_funcs or [])
+        self.loss_aggregate_fn = loss_aggregate_fn
         if len(self.custom_loss_funcs) > self.n_task:
             raise ValueError(f"custom_loss_funcs expects at most {self.n_task} entries, got {len(self.custom_loss_funcs)}")
         if len(self.custom_evaluate_funcs) > self.n_task:
@@ -128,7 +134,7 @@ class MTLTrainer(object):
             ys = ys.to(self.device)
             y_preds = self.model(x_dict)
             loss_list = self._compute_task_losses(y_preds, ys)
-            loss = self._aggregate_task_losses(loss_list)
+            loss = self._aggregate_task_losses(loss_list, y_preds, ys.float())
 
             # Add regularization loss
             reg_loss = self.reg_loss_fn(self.model)
@@ -240,29 +246,39 @@ class MTLTrainer(object):
         """Return the underlying model when wrapped by ``DataParallel``."""
         return self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
 
+    def _supports_n_args(self, func, n_args):
+        """Return whether ``func`` can accept at least ``n_args`` positional arguments."""
+        parameters = inspect.signature(func).parameters.values()
+        positional = [p for p in parameters if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters)
+        return has_varargs or len(positional) >= n_args
+
+    def _call_with_optional_task_id(self, func, first_arg, second_arg, task_id):
+        """Call custom per-task hook with optional ``task_id`` compatibility."""
+        if self._supports_n_args(func, 3):
+            return func(first_arg, second_arg, task_id)
+        return func(first_arg, second_arg)
+
+    def _call_loss_aggregate_fn(self, loss_list, y_preds, ys):
+        """Call custom aggregator with backward-compatible signatures."""
+        if self._supports_n_args(self.loss_aggregate_fn, 3):
+            return self.loss_aggregate_fn(loss_list, y_preds, ys)
+        return self.loss_aggregate_fn(loss_list)
+
     def _compute_task_losses(self, y_preds, ys):
-        """Resolve task losses from model hooks, then apply explicit overrides."""
+        """Resolve per-task losses, allowing task-aware overrides."""
         ys = ys.float()
-        base_model = self._base_model()
-
-        if hasattr(base_model, "compute_task_losses"):
-            loss_list = list(base_model.compute_task_losses(y_preds, ys, default_loss_fns=self.loss_fns))
-        else:
-            loss_list = [self.loss_fns[i](y_preds[:, i], ys[:, i]) for i in range(self.n_task)]
-
-        if len(loss_list) != self.n_task:
-            raise ValueError(f"Expected {self.n_task} task losses, got {len(loss_list)}")
+        loss_list = [self.loss_fns[i](y_preds[:, i], ys[:, i]) for i in range(self.n_task)]
 
         for i, loss_fn in enumerate(self.custom_loss_funcs):
             if loss_fn is not None:
-                loss_list[i] = loss_fn(y_preds, ys)
+                loss_list[i] = self._call_with_optional_task_id(loss_fn, y_preds, ys, i)
         return loss_list
 
-    def _aggregate_task_losses(self, loss_list):
-        """Aggregate task losses with model-specific hooks or adaptive weighting."""
-        base_model = self._base_model()
-        if hasattr(base_model, "aggregate_task_losses"):
-            return base_model.aggregate_task_losses(loss_list)
+    def _aggregate_task_losses(self, loss_list, y_preds, ys):
+        """Aggregate task losses with optional custom reducer and current defaults."""
+        if self.loss_aggregate_fn is not None:
+            return self._call_loss_aggregate_fn(loss_list, y_preds, ys)
 
         if self.adaptive_method is not None and self.adaptive_method == "uwl":
             loss = 0
@@ -271,23 +287,18 @@ class MTLTrainer(object):
                 loss += 2 * loss_i * torch.exp(-w_i) + w_i
             return loss
 
+        if isinstance(self._base_model(), ESMM):
+            return sum(loss_list[1:])
+
         return sum(loss_list) / self.n_task
 
     def _compute_task_metrics(self, targets, predicts):
-        """Resolve task metrics from model hooks, then apply explicit overrides."""
-        base_model = self._base_model()
-
-        if hasattr(base_model, "compute_task_metrics"):
-            scores = list(base_model.compute_task_metrics(targets, predicts, default_metric_fns=self.evaluate_fns))
-        else:
-            scores = [self.evaluate_fns[i](targets[:, i], predicts[:, i]) for i in range(self.n_task)]
-
-        if len(scores) != self.n_task:
-            raise ValueError(f"Expected {self.n_task} task metrics, got {len(scores)}")
+        """Resolve per-task metrics, allowing task-aware overrides."""
+        scores = [self.evaluate_fns[i](targets[:, i], predicts[:, i]) for i in range(self.n_task)]
 
         for i, evaluate_fn in enumerate(self.custom_evaluate_funcs):
             if evaluate_fn is not None:
-                scores[i] = evaluate_fn(targets, predicts)
+                scores[i] = self._call_with_optional_task_id(evaluate_fn, targets, predicts, i)
         return scores
 
     def evaluate(self, model, data_loader):
