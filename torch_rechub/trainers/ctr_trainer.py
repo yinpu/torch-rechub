@@ -27,6 +27,14 @@ class CTRTrainer(object):
         embedding_l2 (float): L2 regularization coefficient for embedding parameters (default=0.0).
         dense_l1 (float): L1 regularization coefficient for dense parameters (default=0.0).
         dense_l2 (float): L2 regularization coefficient for dense parameters (default=0.0).
+        compute_loss_func (callable, optional): custom loss hook with signature
+            ``compute_loss_func(model, x_dict, y)``.
+        compute_metrics (callable, optional): custom metric hook with signature
+            ``compute_metrics(y_true, y_pred)`` returning a float or a metric dict.
+        metric_for_best_model (str): metric key monitored by early stopping and
+            best-checkpoint selection.
+        greater_is_better (bool): whether larger values of
+            ``metric_for_best_model`` indicate a better model.
     """
 
     def __init__(
@@ -44,6 +52,10 @@ class CTRTrainer(object):
         loss_mode=True,
         model_path="./",
         model_logger=None,
+        compute_loss_func=None,
+        compute_metrics=None,
+        metric_for_best_model="auc",
+        greater_is_better=True,
     ):
         self.model = model  # for uniform weights save method in one gpu or multi gpu
         if gpus is None:
@@ -66,8 +78,15 @@ class CTRTrainer(object):
         self.loss_mode = loss_mode
         self.criterion = torch.nn.BCELoss()  # default loss cross_entropy
         self.evaluate_fn = roc_auc_score  # default evaluate function
+        self.compute_loss_func = compute_loss_func
+        self.compute_metrics = compute_metrics
+        self.metric_for_best_model = metric_for_best_model
+        self.greater_is_better = greater_is_better
         self.n_epoch = n_epoch
-        self.early_stopper = EarlyStopper(patience=earlystop_patience)
+        self.early_stopper = EarlyStopper(
+            patience=earlystop_patience,
+            mode="max" if greater_is_better else "min",
+        )
         self.model_path = model_path
         # Initialize regularization loss
         self.reg_loss_fn = RegularizationLoss(**regularization_params)
@@ -82,12 +101,7 @@ class CTRTrainer(object):
         for i, (x_dict, y) in enumerate(tk0):
             x_dict = {k: v.to(self.device) for k, v in x_dict.items()}  # tensor to GPU
             y = y.to(self.device).float()
-            if self.loss_mode:
-                y_pred = self.model(x_dict)
-                loss = self.criterion(y_pred, y)
-            else:
-                y_pred, other_loss = self.model(x_dict)
-                loss = self.criterion(y_pred, y) + other_loss
+            loss = self._compute_batch_loss(x_dict, y)
 
             # Add regularization loss
             reg_loss = self.reg_loss_fn(self.model)
@@ -123,14 +137,15 @@ class CTRTrainer(object):
                 self.scheduler.step()  # update lr in epoch level by scheduler
 
             if val_dataloader:
-                auc = self.evaluate(self.model, val_dataloader)
-                print('epoch:', epoch_i, 'validation: auc:', auc)
+                metrics = self._evaluate_metrics(self.model, val_dataloader)
+                monitor_value = self._get_monitor_value(metrics)
+                print('epoch:', epoch_i, 'validation metrics:', metrics)
 
                 for logger in self._iter_loggers():
-                    logger.log_metrics({'val/auc': auc}, step=epoch_i)
+                    logger.log_metrics({f'val/{name}': value for name, value in metrics.items()}, step=epoch_i)
 
-                if self.early_stopper.stop_training(auc, self.model.state_dict()):
-                    print(f'validation: best auc: {self.early_stopper.best_auc}')
+                if self.early_stopper.stop_training(monitor_value, self.model.state_dict()):
+                    print(f'validation: best {self.metric_for_best_model}: {self.early_stopper.best_score}')
                     self.model.load_state_dict(self.early_stopper.best_weights)
                     break
 
@@ -153,7 +168,46 @@ class CTRTrainer(object):
             return list(self.model_logger)
         return [self.model_logger]
 
-    def evaluate(self, model, data_loader):
+    def evaluate(self, model, data_loader, return_dict=None):
+        """Evaluate the model on a validation/test data loader.
+
+        Args:
+            model (nn.Module): model to evaluate.
+            data_loader (DataLoader): evaluation data loader.
+            return_dict (bool, optional): when ``True``, return a metric dict.
+                When ``False``, return the scalar selected by
+                ``metric_for_best_model``. Defaults to ``True`` only when a
+                custom ``compute_metrics`` hook is configured.
+
+        Returns:
+            float or dict[str, float]: scalar monitor metric or a metric dict.
+        """
+        if return_dict is None:
+            return_dict = self.compute_metrics is not None
+        metrics = self._evaluate_metrics(model, data_loader)
+        if return_dict:
+            return metrics
+        return self._get_monitor_value(metrics)
+
+    def _compute_batch_loss(self, x_dict, y):
+        """Compute task loss before regularization."""
+        if self.compute_loss_func is not None:
+            return self.compute_loss_func(self.model, x_dict, y)
+        if self.loss_mode:
+            y_pred = self.model(x_dict)
+            return self.criterion(y_pred, y)
+        y_pred, other_loss = self.model(x_dict)
+        return self.criterion(y_pred, y) + other_loss
+
+    def _predict_batch(self, model, x_dict):
+        """Run a forward pass and return predictions only."""
+        if self.loss_mode:
+            return model(x_dict)
+        y_pred, _ = model(x_dict)
+        return y_pred
+
+    def _evaluate_metrics(self, model, data_loader):
+        """Collect predictions on ``data_loader`` and compute metrics."""
         model.eval()
         targets, predicts = list(), list()
         with torch.no_grad():
@@ -162,13 +216,27 @@ class CTRTrainer(object):
                 x_dict = {k: v.to(self.device) for k, v in x_dict.items()}
                 # 确保y是float类型且维度为[batch_size, 1]
                 y = y.to(self.device).float().view(-1, 1)
-                if self.loss_mode:
-                    y_pred = model(x_dict)
-                else:
-                    y_pred, _ = model(x_dict)
+                y_pred = self._predict_batch(model, x_dict)
                 targets.extend(y.tolist())
                 predicts.extend(y_pred.tolist())
-        return self.evaluate_fn(targets, predicts)
+        if self.compute_metrics is not None:
+            raw_metrics = self.compute_metrics(targets, predicts)
+            return self._normalize_metrics(raw_metrics, default_name=self.metric_for_best_model)
+        return self._normalize_metrics(self.evaluate_fn(targets, predicts), default_name=self.metric_for_best_model)
+
+    def _normalize_metrics(self, metrics, default_name):
+        """Normalize custom metric output to ``dict[str, float]``."""
+        if isinstance(metrics, dict):
+            return {str(name): float(value) for name, value in metrics.items()}
+        return {default_name: float(metrics)}
+
+    def _get_monitor_value(self, metrics):
+        """Extract the score tracked by early stopping and model selection."""
+        if self.metric_for_best_model not in metrics:
+            raise ValueError(
+                f"metric_for_best_model={self.metric_for_best_model!r} was not found in evaluation metrics: {sorted(metrics.keys())}"
+            )
+        return metrics[self.metric_for_best_model]
 
     def predict(self, model, data_loader):
         model.eval()
@@ -178,10 +246,7 @@ class CTRTrainer(object):
             for i, (x_dict, y) in enumerate(tk0):
                 x_dict = {k: v.to(self.device) for k, v in x_dict.items()}
                 y = y.to(self.device)
-                if self.loss_mode:
-                    y_pred = model(x_dict)
-                else:
-                    y_pred, _ = model(x_dict)
+                y_pred = self._predict_batch(model, x_dict)
                 predicts.extend(y_pred.tolist())
         return predicts
 

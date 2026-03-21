@@ -64,6 +64,10 @@ trainer.visualization(save_path="deepfm_architecture.pdf")
 - `gpus`: List of GPU ids.
 - `loss_mode`: Boolean. `True` when the model returns only predictions; `False` when the model returns predictions plus auxiliary loss.
 - `model_path`: Path to save the model.
+- `compute_loss_func`: Optional callable `compute_loss_func(model, x_dict, y)` to override the default training loss.
+- `compute_metrics`: Optional callable `compute_metrics(y_true, y_pred)` returning a float or `dict[str, float]`.
+- `metric_for_best_model`: Metric name used for early stopping and best-checkpoint selection.
+- `greater_is_better`: Whether a larger `metric_for_best_model` value indicates a better model.
 
 ### MatchTrainer
 
@@ -108,6 +112,10 @@ trainer.export_onnx("item_tower.onnx", mode="item")
 - `device`: Training device.
 - `gpus`: List of GPU ids.
 - `model_path`: Path to save the model.
+- `compute_loss_func`: Optional callable `compute_loss_func(model, x_dict, y)` to override the built-in point-wise / pair-wise / list-wise loss.
+- `compute_metrics`: Optional callable `compute_metrics(y_true, y_pred)` returning a float or `dict[str, float]`.
+- `metric_for_best_model`: Metric name used for early stopping and best-checkpoint selection.
+- `greater_is_better`: Whether a larger `metric_for_best_model` value indicates a better model.
 
 ### MTLTrainer
 
@@ -155,6 +163,93 @@ trainer.export_onnx("mmoe.onnx")
 - `device`: Training device.
 - `gpus`: List of GPU ids.
 - `model_path`: Path to save the model.
+- `loss_fns`: Optional list of custom task losses. Its length must equal `len(task_types)`.
+- `evaluate_fns`: Optional list of per-task metric functions used by the default evaluator.
+- `metric_names`: Optional list of metric names used in logs such as `val/task_0_auc`.
+- `compute_metrics`: Optional callable `compute_metrics(targets, predicts)` returning a metric dict.
+- `metric_for_best_model`: Metric name used for early stopping and best-checkpoint selection.
+- `greater_is_better`: Whether a larger `metric_for_best_model` value indicates a better model.
+
+## Custom Losses & Metrics
+
+All trainers now support explicit hook-style customization similar to Hugging Face `Trainer`.
+
+### Ranking / CTR
+
+```python
+import numpy as np
+import torch.nn.functional as F
+
+def focal_loss(model, x_dict, y):
+    y_pred = model(x_dict)
+    bce = F.binary_cross_entropy(y_pred, y, reduction="none")
+    pt = y * y_pred + (1 - y) * (1 - y_pred)
+    return ((1 - pt) ** 2 * bce).mean()
+
+def logloss_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.clip(np.asarray(y_pred).reshape(-1), 1e-6, 1 - 1e-6)
+    logloss = -(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)).mean()
+    return {"logloss": float(logloss)}
+
+trainer = CTRTrainer(
+    model=model,
+    compute_loss_func=focal_loss,
+    compute_metrics=logloss_metrics,
+    metric_for_best_model="logloss",
+    greater_is_better=False,
+)
+```
+
+### Matching
+
+```python
+def pairwise_loss(model, x_dict, y):
+    pos_score, neg_score = model(x_dict)
+    return -(pos_score - neg_score).sigmoid().log().mean()
+
+trainer = MatchTrainer(
+    model=model,
+    mode=1,
+    compute_loss_func=pairwise_loss,
+)
+```
+
+### Multi-task
+
+```python
+import numpy as np
+import torch.nn.functional as F
+
+loss_fns = [
+    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
+    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
+]
+
+def multitask_metrics(targets, predicts):
+    targets = np.asarray(targets)
+    predicts = np.asarray(predicts)
+    mae = np.abs(targets - predicts).mean(axis=0)
+    return {
+        "task_0_mae": float(mae[0]),
+        "task_1_mae": float(mae[1]),
+    }
+
+trainer = MTLTrainer(
+    model=model,
+    task_types=["classification", "classification"],
+    loss_fns=loss_fns,
+    metric_names=["mae", "mae"],
+    compute_metrics=multitask_metrics,
+    metric_for_best_model="task_1_mae",
+    greater_is_better=False,
+)
+```
+
+Notes:
+- `compute_metrics` should return a single float or a metric dict.
+- `metric_for_best_model` must match one key from the metric dict when multiple metrics are returned.
+- Use `greater_is_better=False` for metrics such as `loss`, `logloss`, `mse`, `mae`, or `rmse`.
 
 ## Callbacks
 
@@ -204,4 +299,3 @@ from torch_rechub.basic.loss_func import BPRLoss
 bpr_loss = BPRLoss()
 loss = bpr_loss(pos_score, neg_score)
 ```
-

@@ -29,6 +29,19 @@ class MTLTrainer(object):
         device (str): `"cpu"` or `"cuda:0"`
         gpus (list): id of multi gpu (default=[]). If the length >=1, then the model will wrapped by nn.DataParallel.
         model_path (str): the path you want to save the model (default="./"). Note only save the best weight in the validation data.
+        loss_fns (list, optional): custom per-task loss functions. The length
+            must equal the number of tasks.
+        evaluate_fns (list, optional): custom per-task metric functions used by
+            the default evaluation path.
+        metric_names (list[str], optional): names used in logs and metric keys
+            such as ``task_0_auc``.
+        compute_metrics (callable, optional): custom metric hook with signature
+            ``compute_metrics(targets, predicts)`` returning a float or a
+            metric dict.
+        metric_for_best_model (str, optional): metric key monitored by early
+            stopping and best-checkpoint selection.
+        greater_is_better (bool, optional): whether larger values of
+            ``metric_for_best_model`` indicate a better model.
     """
 
     def __init__(
@@ -48,6 +61,12 @@ class MTLTrainer(object):
         gpus=None,
         model_path="./",
         model_logger=None,
+        loss_fns=None,
+        evaluate_fns=None,
+        metric_names=None,
+        compute_metrics=None,
+        metric_for_best_model=None,
+        greater_is_better=None,
     ):
         self.model = model
         if gpus is None:
@@ -89,11 +108,32 @@ class MTLTrainer(object):
         self.scheduler = None
         if scheduler_fn is not None:
             self.scheduler = scheduler_fn(self.optimizer, **scheduler_params)
-        self.loss_fns = [get_loss_func(task_type) for task_type in task_types]
-        self.evaluate_fns = [get_metric_func(task_type) for task_type in task_types]
+        if loss_fns is None:
+            self.loss_fns = [get_loss_func(task_type) for task_type in task_types]
+        else:
+            if len(loss_fns) != self.n_task:
+                raise ValueError(f"loss_fns must have length {self.n_task}, got {len(loss_fns)}")
+            self.loss_fns = list(loss_fns)
+        if evaluate_fns is None:
+            self.evaluate_fns = [get_metric_func(task_type) for task_type in task_types]
+        else:
+            if len(evaluate_fns) != self.n_task:
+                raise ValueError(f"evaluate_fns must have length {self.n_task}, got {len(evaluate_fns)}")
+            self.evaluate_fns = list(evaluate_fns)
+        self.metric_names = self._init_metric_names(task_types, metric_names)
+        self.compute_metrics = compute_metrics
+        if metric_for_best_model is None:
+            metric_for_best_model = f"task_{earlystop_taskid}_{self.metric_names[earlystop_taskid]}"
+        self.metric_for_best_model = metric_for_best_model
+        if greater_is_better is None:
+            greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, task_types[earlystop_taskid])
+        self.greater_is_better = greater_is_better
         self.n_epoch = n_epoch
         self.earlystop_taskid = earlystop_taskid
-        self.early_stopper = EarlyStopper(patience=earlystop_patience)
+        self.early_stopper = EarlyStopper(
+            patience=earlystop_patience,
+            mode="max" if greater_is_better else "min",
+        )
 
         self.gpus = gpus
         if len(gpus) > 1:
@@ -115,19 +155,8 @@ class MTLTrainer(object):
             x_dict = {k: v.to(self.device) for k, v in x_dict.items()}  # tensor to GPU
             ys = ys.to(self.device)
             y_preds = self.model(x_dict)
-            loss_list = [self.loss_fns[i](y_preds[:, i], ys[:, i].float()) for i in range(self.n_task)]
-            if isinstance(self.model, ESMM):
-                # ESSM only compute loss for ctr and ctcvr task
-                loss = sum(loss_list[1:])
-            else:
-                if self.adaptive_method is not None:
-                    if self.adaptive_method == "uwl":
-                        loss = 0
-                        for loss_i, w_i in zip(loss_list, self.loss_weight):
-                            w_i = torch.clamp(w_i, min=0)
-                            loss += 2 * loss_i * torch.exp(-w_i) + w_i
-                else:
-                    loss = sum(loss_list) / self.n_task
+            loss_list = self._compute_task_losses(y_preds, ys)
+            loss = self._aggregate_loss(loss_list)
 
             # Add regularization loss
             reg_loss = self.reg_loss_fn(self.model)
@@ -183,13 +212,19 @@ class MTLTrainer(object):
                     print("Current lr : {}".format(self.optimizer.state_dict()['param_groups'][0]['lr']))
                 self.scheduler.step()  # update lr in epoch level by scheduler
 
-            scores = self.evaluate(self.model, val_dataloader)
-            print('epoch:', epoch_i, 'validation scores: ', scores)
+            metrics = self.evaluate(self.model, val_dataloader, return_dict=True)
+            monitor_value = self._get_monitor_value(metrics)
+            print('epoch:', epoch_i, 'validation metrics:', metrics)
 
-            for task_id, score in enumerate(scores):
+            task_metric_values = self._task_metric_values(metrics)
+            for task_id, score in enumerate(task_metric_values):
                 logs[f'val/task_{task_id}_score'] = score
+                logs[f'val/task_{task_id}_{self.metric_names[task_id]}'] = score
                 _log_per_epoch.append(score)
-            logs['auc'] = scores[self.earlystop_taskid]
+
+            for name, value in metrics.items():
+                logs[f'val/{name}'] = value
+            logs['auc'] = monitor_value
 
             if self.loss_weight:
                 for task_id, weight in enumerate(self.loss_weight):
@@ -201,8 +236,11 @@ class MTLTrainer(object):
             for logger in self._iter_loggers():
                 logger.log_metrics(logs, step=epoch_i)
 
-            if self.early_stopper.stop_training(scores[self.earlystop_taskid], self.model.state_dict()):
-                print('validation best auc of main task %d: %.6f' % (self.earlystop_taskid, self.early_stopper.best_auc))
+            if self.early_stopper.stop_training(monitor_value, self.model.state_dict()):
+                print(
+                    'validation best %s of main task %d: %.6f'
+                    % (self.metric_for_best_model, self.earlystop_taskid, self.early_stopper.best_score)
+                )
                 self.model.load_state_dict(self.early_stopper.best_weights)
                 break
 
@@ -235,7 +273,98 @@ class MTLTrainer(object):
             return self.optimizer.param_groups[0]['lr']
         return None
 
-    def evaluate(self, model, data_loader):
+    def _init_metric_names(self, task_types, metric_names):
+        """Resolve metric names used in logs and early stopping."""
+        if metric_names is not None:
+            if len(metric_names) != self.n_task:
+                raise ValueError(f"metric_names must have length {self.n_task}, got {len(metric_names)}")
+            return list(metric_names)
+        default_names = []
+        for task_type in task_types:
+            if task_type == "classification":
+                default_names.append("auc")
+            elif task_type == "regression":
+                default_names.append("mse")
+            else:
+                default_names.append("score")
+        return default_names
+
+    def _infer_greater_is_better(self, metric_name, task_type):
+        """Infer whether larger metric values indicate better models."""
+        metric_name = metric_name.lower()
+        if any(loss_name in metric_name for loss_name in ["loss", "mse", "mae", "rmse", "error", "logloss", "log_loss"]):
+            return False
+        if task_type == "regression":
+            return False
+        return True
+
+    def _compute_task_losses(self, y_preds, ys):
+        """Compute one loss tensor per task."""
+        return [self.loss_fns[i](y_preds[:, i], ys[:, i].float()) for i in range(self.n_task)]
+
+    def _aggregate_loss(self, loss_list):
+        """Aggregate task losses according to the configured MTL strategy."""
+        base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        if isinstance(base_model, ESMM):
+            # ESMM only computes loss for ctr and ctcvr tasks.
+            return sum(loss_list[1:])
+
+        if self.adaptive_method is not None:
+            if self.adaptive_method == "uwl":
+                loss = 0
+                for loss_i, w_i in zip(loss_list, self.loss_weight):
+                    w_i = torch.clamp(w_i, min=0)
+                    loss += 2 * loss_i * torch.exp(-w_i) + w_i
+                return loss
+        return sum(loss_list) / self.n_task
+
+    def _default_metrics(self, targets, predicts):
+        """Compute the default per-task metrics."""
+        metrics = {}
+        for task_id in range(self.n_task):
+            metric_name = f"task_{task_id}_{self.metric_names[task_id]}"
+            metrics[metric_name] = float(self.evaluate_fns[task_id](targets[:, task_id], predicts[:, task_id]))
+        return metrics
+
+    def _normalize_metrics(self, metrics, default_name):
+        """Normalize custom metric output to ``dict[str, float]``."""
+        if isinstance(metrics, dict):
+            return {str(name): float(value) for name, value in metrics.items()}
+        return {default_name: float(metrics)}
+
+    def _get_monitor_value(self, metrics):
+        """Extract the score tracked by early stopping and model selection."""
+        if self.metric_for_best_model not in metrics:
+            raise ValueError(
+                f"metric_for_best_model={self.metric_for_best_model!r} was not found in evaluation metrics: {sorted(metrics.keys())}"
+            )
+        return metrics[self.metric_for_best_model]
+
+    def _task_metric_values(self, metrics):
+        """Return per-task metric values in task order when available."""
+        values = []
+        for task_id, metric_name in enumerate(self.metric_names):
+            key = f"task_{task_id}_{metric_name}"
+            if key in metrics:
+                values.append(metrics[key])
+        return values
+
+    def evaluate(self, model, data_loader, return_dict=None):
+        """Evaluate the model on a validation/test data loader.
+
+        Args:
+            model (nn.Module): model to evaluate.
+            data_loader (DataLoader): evaluation data loader.
+            return_dict (bool, optional): when ``True``, return a metric dict.
+                When ``False``, return the historical list output used by the
+                built-in per-task evaluators, or the scalar selected by
+                ``metric_for_best_model`` when ``compute_metrics`` is set.
+
+        Returns:
+            list[float] or float or dict[str, float]: evaluation result.
+        """
+        if return_dict is None:
+            return_dict = self.compute_metrics is not None
         model.eval()
         targets, predicts = list(), list()
         with torch.no_grad():
@@ -247,8 +376,19 @@ class MTLTrainer(object):
                 targets.extend(ys.tolist())
                 predicts.extend(y_preds.tolist())
         targets, predicts = np.array(targets), np.array(predicts)
-        scores = [self.evaluate_fns[i](targets[:, i], predicts[:, i]) for i in range(self.n_task)]
-        return scores
+        if self.compute_metrics is not None:
+            metrics = self._normalize_metrics(
+                self.compute_metrics(targets, predicts),
+                default_name=self.metric_for_best_model,
+            )
+            if return_dict:
+                return metrics
+            return self._get_monitor_value(metrics)
+
+        metrics = self._default_metrics(targets, predicts)
+        if return_dict:
+            return metrics
+        return [metrics[f"task_{task_id}_{self.metric_names[task_id]}"] for task_id in range(self.n_task)]
 
     def predict(self, model, data_loader):
         model.eval()

@@ -73,6 +73,10 @@ trainer.visualization(save_path="deepfm_architecture.pdf")
 - `gpus`：多GPU列表
 - `loss_mode`：损失模式，布尔值。True表示模型只返回预测值，False表示模型返回预测值和额外损失
 - `model_path`：模型保存路径
+- `compute_loss_func`：可选的自定义损失函数，签名为 `compute_loss_func(model, x_dict, y)`
+- `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(y_true, y_pred)`，可返回单个 float 或 `dict[str, float]`
+- `metric_for_best_model`：用于早停和最优模型选择的指标名
+- `greater_is_better`：`metric_for_best_model` 是否“越大越好”
 
 ### MatchTrainer
 
@@ -119,6 +123,10 @@ trainer.export_onnx("item_tower.onnx", mode="item")
 - `device`：训练设备
 - `gpus`：多GPU列表
 - `model_path`：模型保存路径
+- `compute_loss_func`：可选的自定义损失函数，签名为 `compute_loss_func(model, x_dict, y)`，可覆盖内置 point-wise / pair-wise / list-wise 损失
+- `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(y_true, y_pred)`，可返回单个 float 或 `dict[str, float]`
+- `metric_for_best_model`：用于早停和最优模型选择的指标名
+- `greater_is_better`：`metric_for_best_model` 是否“越大越好”
 
 ### MTLTrainer
 
@@ -166,6 +174,93 @@ trainer.export_onnx("mmoe.onnx")
 - `device`：训练设备
 - `gpus`：多GPU列表
 - `model_path`：模型保存路径
+- `loss_fns`：可选的任务损失函数列表，长度必须等于 `len(task_types)`
+- `evaluate_fns`：可选的逐任务评估函数列表，用于默认评估路径
+- `metric_names`：可选的指标名列表，用于生成 `val/task_0_auc` 这类日志键
+- `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(targets, predicts)`，返回指标字典
+- `metric_for_best_model`：用于早停和最优模型选择的指标名
+- `greater_is_better`：`metric_for_best_model` 是否“越大越好”
+
+## 自定义损失函数与评估函数
+
+现在各类 trainer 都支持显式的 hook 式扩展，使用方式和 Hugging Face `Trainer` 的自定义接口类似。
+
+### 排序 / CTR
+
+```python
+import numpy as np
+import torch.nn.functional as F
+
+def focal_loss(model, x_dict, y):
+    y_pred = model(x_dict)
+    bce = F.binary_cross_entropy(y_pred, y, reduction="none")
+    pt = y * y_pred + (1 - y) * (1 - y_pred)
+    return ((1 - pt) ** 2 * bce).mean()
+
+def logloss_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.clip(np.asarray(y_pred).reshape(-1), 1e-6, 1 - 1e-6)
+    logloss = -(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)).mean()
+    return {"logloss": float(logloss)}
+
+trainer = CTRTrainer(
+    model=model,
+    compute_loss_func=focal_loss,
+    compute_metrics=logloss_metrics,
+    metric_for_best_model="logloss",
+    greater_is_better=False,
+)
+```
+
+### 召回 / Matching
+
+```python
+def pairwise_loss(model, x_dict, y):
+    pos_score, neg_score = model(x_dict)
+    return -(pos_score - neg_score).sigmoid().log().mean()
+
+trainer = MatchTrainer(
+    model=model,
+    mode=1,
+    compute_loss_func=pairwise_loss,
+)
+```
+
+### 多任务
+
+```python
+import numpy as np
+import torch.nn.functional as F
+
+loss_fns = [
+    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
+    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
+]
+
+def multitask_metrics(targets, predicts):
+    targets = np.asarray(targets)
+    predicts = np.asarray(predicts)
+    mae = np.abs(targets - predicts).mean(axis=0)
+    return {
+        "task_0_mae": float(mae[0]),
+        "task_1_mae": float(mae[1]),
+    }
+
+trainer = MTLTrainer(
+    model=model,
+    task_types=["classification", "classification"],
+    loss_fns=loss_fns,
+    metric_names=["mae", "mae"],
+    compute_metrics=multitask_metrics,
+    metric_for_best_model="task_1_mae",
+    greater_is_better=False,
+)
+```
+
+注意：
+- `compute_metrics` 可以返回单个 float，也可以返回指标字典。
+- 当返回多个指标时，`metric_for_best_model` 必须对应其中一个 key。
+- 对于 `loss`、`logloss`、`mse`、`mae`、`rmse` 这类越小越好的指标，需要设置 `greater_is_better=False`。
 
 ## 回调函数
 

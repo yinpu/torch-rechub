@@ -28,6 +28,14 @@ class MatchTrainer(object):
         in_batch_neg_ratio (int): number of negatives to draw from the batch per positive sample when in_batch_neg is True.
         hard_negative (bool): whether to choose hardest negatives within batch (top-k by score) instead of uniform random.
         sampler_seed (int): optional random seed for in-batch sampler to ease reproducibility/testing.
+        compute_loss_func (callable, optional): custom loss hook with signature
+            ``compute_loss_func(model, x_dict, y)``.
+        compute_metrics (callable, optional): custom metric hook with signature
+            ``compute_metrics(y_true, y_pred)`` returning a float or a metric dict.
+        metric_for_best_model (str): metric key monitored by early stopping and
+            best-checkpoint selection.
+        greater_is_better (bool): whether larger values of
+            ``metric_for_best_model`` indicate a better model.
     """
 
     def __init__(
@@ -49,6 +57,10 @@ class MatchTrainer(object):
         gpus=None,
         model_path="./",
         model_logger=None,
+        compute_loss_func=None,
+        compute_metrics=None,
+        metric_for_best_model="auc",
+        greater_is_better=True,
     ):
         self.model = model  # for uniform weights save method in one gpu or multi gpu
         if gpus is None:
@@ -95,8 +107,15 @@ class MatchTrainer(object):
         if scheduler_fn is not None:
             self.scheduler = scheduler_fn(self.optimizer, **scheduler_params)
         self.evaluate_fn = roc_auc_score  # default evaluate function
+        self.compute_loss_func = compute_loss_func
+        self.compute_metrics = compute_metrics
+        self.metric_for_best_model = metric_for_best_model
+        self.greater_is_better = greater_is_better
         self.n_epoch = n_epoch
-        self.early_stopper = EarlyStopper(patience=earlystop_patience)
+        self.early_stopper = EarlyStopper(
+            patience=earlystop_patience,
+            mode="max" if greater_is_better else "min",
+        )
         self.model_path = model_path
         # Initialize regularization loss
         self.reg_loss_fn = RegularizationLoss(**regularization_params)
@@ -111,38 +130,7 @@ class MatchTrainer(object):
         for i, (x_dict, y) in enumerate(tk0):
             x_dict = {k: v.to(self.device) for k, v in x_dict.items()}  # tensor to GPU
             y = y.to(self.device)
-            if self.mode == 0:
-                y = y.float()  # torch._C._nn.binary_cross_entropy expected Float
-            else:
-                y = y.long()  #
-            if self.in_batch_neg:
-                base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
-                user_embedding = base_model.user_tower(x_dict)
-                item_embedding = base_model.item_tower(x_dict)
-                if user_embedding is None or item_embedding is None:
-                    raise ValueError("Model must return user/item embeddings when in_batch_neg is True.")
-                if user_embedding.dim() > 2 and user_embedding.size(1) == 1:
-                    user_embedding = user_embedding.squeeze(1)
-                if item_embedding.dim() > 2 and item_embedding.size(1) == 1:
-                    item_embedding = item_embedding.squeeze(1)
-                if user_embedding.dim() != 2 or item_embedding.dim() != 2:
-                    raise ValueError(f"In-batch negative sampling requires 2D embeddings, got shapes {user_embedding.shape} and {item_embedding.shape}")
-
-                scores = torch.matmul(user_embedding, item_embedding.t())  # bs x bs
-                neg_indices = inbatch_negative_sampling(scores, neg_ratio=self.in_batch_neg_ratio, hard_negative=self.hard_negative, generator=self._sampler_generator)
-                logits = gather_inbatch_logits(scores, neg_indices)
-                if self.mode == 1:  # pair_wise
-                    loss = self.criterion(logits[:, 0], logits[:, 1:], in_batch_neg=True)
-                else:  # point-wise/list-wise -> cross entropy on sampled logits
-                    targets = torch.zeros(logits.size(0), dtype=torch.long, device=self.device)
-                    loss = self.criterion(logits, targets)
-            else:
-                if self.mode == 1:  # pair_wise
-                    pos_score, neg_score = self.model(x_dict)
-                    loss = self.criterion(pos_score, neg_score)
-                else:
-                    y_pred = self.model(x_dict)
-                    loss = self.criterion(y_pred, y)
+            loss = self._compute_batch_loss(x_dict, y)
 
             # Add regularization loss
             reg_loss = self.reg_loss_fn(self.model)
@@ -192,14 +180,15 @@ class MatchTrainer(object):
                 self.scheduler.step()  # update lr in epoch level by scheduler
 
             if val_dataloader:
-                auc = self.evaluate(self.model, val_dataloader)
-                print('epoch:', epoch_i, 'validation: auc:', auc)
+                metrics = self._evaluate_metrics(self.model, val_dataloader)
+                monitor_value = self._get_monitor_value(metrics)
+                print('epoch:', epoch_i, 'validation metrics:', metrics)
 
                 for logger in self._iter_loggers():
-                    logger.log_metrics({'val/auc': auc}, step=epoch_i)
+                    logger.log_metrics({f'val/{name}': value for name, value in metrics.items()}, step=epoch_i)
 
-                if self.early_stopper.stop_training(auc, self.model.state_dict()):
-                    print(f'validation: best auc: {self.early_stopper.best_auc}')
+                if self.early_stopper.stop_training(monitor_value, self.model.state_dict()):
+                    print(f'validation: best {self.metric_for_best_model}: {self.early_stopper.best_score}')
                     self.model.load_state_dict(self.early_stopper.best_weights)
                     break
 
@@ -222,7 +211,71 @@ class MatchTrainer(object):
             return list(self.model_logger)
         return [self.model_logger]
 
-    def evaluate(self, model, data_loader):
+    def evaluate(self, model, data_loader, return_dict=None):
+        """Evaluate the model on a validation/test data loader.
+
+        Args:
+            model (nn.Module): model to evaluate.
+            data_loader (DataLoader): evaluation data loader.
+            return_dict (bool, optional): when ``True``, return a metric dict.
+                When ``False``, return the scalar selected by
+                ``metric_for_best_model``. Defaults to ``True`` only when a
+                custom ``compute_metrics`` hook is configured.
+
+        Returns:
+            float or dict[str, float]: scalar monitor metric or a metric dict.
+        """
+        if return_dict is None:
+            return_dict = self.compute_metrics is not None
+        metrics = self._evaluate_metrics(model, data_loader)
+        if return_dict:
+            return metrics
+        return self._get_monitor_value(metrics)
+
+    def _prepare_target(self, y):
+        """Cast labels to the type expected by the active training mode."""
+        if self.mode == 0:
+            return y.float()
+        return y.long()
+
+    def _compute_default_loss(self, x_dict, y):
+        """Compute task loss before regularization using built-in training modes."""
+        y = self._prepare_target(y)
+        if self.in_batch_neg:
+            base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+            user_embedding = base_model.user_tower(x_dict)
+            item_embedding = base_model.item_tower(x_dict)
+            if user_embedding is None or item_embedding is None:
+                raise ValueError("Model must return user/item embeddings when in_batch_neg is True.")
+            if user_embedding.dim() > 2 and user_embedding.size(1) == 1:
+                user_embedding = user_embedding.squeeze(1)
+            if item_embedding.dim() > 2 and item_embedding.size(1) == 1:
+                item_embedding = item_embedding.squeeze(1)
+            if user_embedding.dim() != 2 or item_embedding.dim() != 2:
+                raise ValueError(f"In-batch negative sampling requires 2D embeddings, got shapes {user_embedding.shape} and {item_embedding.shape}")
+
+            scores = torch.matmul(user_embedding, item_embedding.t())  # bs x bs
+            neg_indices = inbatch_negative_sampling(scores, neg_ratio=self.in_batch_neg_ratio, hard_negative=self.hard_negative, generator=self._sampler_generator)
+            logits = gather_inbatch_logits(scores, neg_indices)
+            if self.mode == 1:  # pair_wise
+                return self.criterion(logits[:, 0], logits[:, 1:], in_batch_neg=True)
+            targets = torch.zeros(logits.size(0), dtype=torch.long, device=self.device)
+            return self.criterion(logits, targets)
+
+        if self.mode == 1:  # pair_wise
+            pos_score, neg_score = self.model(x_dict)
+            return self.criterion(pos_score, neg_score)
+        y_pred = self.model(x_dict)
+        return self.criterion(y_pred, y)
+
+    def _compute_batch_loss(self, x_dict, y):
+        """Compute task loss before regularization."""
+        if self.compute_loss_func is not None:
+            return self.compute_loss_func(self.model, x_dict, y)
+        return self._compute_default_loss(x_dict, y)
+
+    def _evaluate_metrics(self, model, data_loader):
+        """Collect predictions on ``data_loader`` and compute metrics."""
         model.eval()
         targets, predicts = list(), list()
         with torch.no_grad():
@@ -233,7 +286,24 @@ class MatchTrainer(object):
                 y_pred = model(x_dict)
                 targets.extend(y.tolist())
                 predicts.extend(y_pred.tolist())
-        return self.evaluate_fn(targets, predicts)
+        if self.compute_metrics is not None:
+            raw_metrics = self.compute_metrics(targets, predicts)
+            return self._normalize_metrics(raw_metrics, default_name=self.metric_for_best_model)
+        return self._normalize_metrics(self.evaluate_fn(targets, predicts), default_name=self.metric_for_best_model)
+
+    def _normalize_metrics(self, metrics, default_name):
+        """Normalize custom metric output to ``dict[str, float]``."""
+        if isinstance(metrics, dict):
+            return {str(name): float(value) for name, value in metrics.items()}
+        return {default_name: float(metrics)}
+
+    def _get_monitor_value(self, metrics):
+        """Extract the score tracked by early stopping and model selection."""
+        if self.metric_for_best_model not in metrics:
+            raise ValueError(
+                f"metric_for_best_model={self.metric_for_best_model!r} was not found in evaluation metrics: {sorted(metrics.keys())}"
+            )
+        return metrics[self.metric_for_best_model]
 
     def predict(self, model, data_loader):
         model.eval()
