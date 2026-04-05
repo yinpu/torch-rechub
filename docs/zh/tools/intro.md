@@ -27,7 +27,7 @@ Torch-RecHub 提供了丰富的研发工具，帮助开发者更高效地进行�
 from torch_rechub.basic.callback import EarlyStopper
 
 # 创建早停器，连续10轮验证集性能没有提升就停止训练
-early_stopper = EarlyStopper(patience=10)
+early_stopper = EarlyStopper(patience=10, mode="max")
 
 # 在训练循环中使用
 for epoch in range(n_epoch):
@@ -35,7 +35,7 @@ for epoch in range(n_epoch):
     val_auc = evaluate(model, val_dataloader)
 
     if early_stopper.stop_training(val_auc, model.state_dict()):
-        print(f'Early stopping! Best AUC: {early_stopper.best_auc}')
+        print(f'Early stopping! Best score: {early_stopper.best_score}')
         model.load_state_dict(early_stopper.best_weights)
         break
 ```
@@ -141,4 +141,3 @@ loss = nce_loss(logits, targets)
 - 了解 [回调函数](/zh/tools/callbacks) 的详细用法
 - 了解 [实验追踪](/zh/tools/tracking) 的配置方法
 - 了解 [可视化监控](/zh/tools/visualization) 的使用方式
-

@@ -27,7 +27,7 @@ Early stopper stops training when validation performance stops improving, preven
 from torch_rechub.basic.callback import EarlyStopper
 
 # Create early stopper, stop training if no improvement for 10 consecutive epochs
-early_stopper = EarlyStopper(patience=10)
+early_stopper = EarlyStopper(patience=10, mode="max")
 
 # Use in training loop
 for epoch in range(n_epoch):
@@ -35,7 +35,7 @@ for epoch in range(n_epoch):
     val_auc = evaluate(model, val_dataloader)
 
     if early_stopper.stop_training(val_auc, model.state_dict()):
-        print(f'Early stopping! Best AUC: {early_stopper.best_auc}')
+        print(f'Early stopping! Best score: {early_stopper.best_score}')
         model.load_state_dict(early_stopper.best_weights)
         break
 ```
@@ -141,4 +141,3 @@ loss = nce_loss(logits, targets)
 - Learn about [Callbacks](/tools/callbacks) in detail
 - Learn about [Experiment Tracking](/tools/tracking) configuration
 - Learn about [Visualization](/tools/visualization) usage
-

@@ -163,7 +163,7 @@ trainer.export_onnx("mmoe.onnx")
 - `device`: Training device.
 - `gpus`: List of GPU ids.
 - `model_path`: Path to save the model.
-- `loss_fns`: Optional list of custom task losses. Its length must equal `len(task_types)`.
+- `compute_task_losses_func`: Optional multi-task loss hook with signature `compute_task_losses_func(model, x_dict, ys, y_preds)`.
 - `evaluate_fns`: Optional list of per-task metric functions used by the default evaluator.
 - `metric_names`: Optional list of metric names used in logs such as `val/task_0_auc`.
 - `compute_metrics`: Optional callable `compute_metrics(targets, predicts)` returning a metric dict.
@@ -173,6 +173,8 @@ trainer.export_onnx("mmoe.onnx")
 ## Custom Losses & Metrics
 
 All trainers now support explicit hook-style customization similar to Hugging Face `Trainer`.
+
+For a full guide covering hook signatures, monitor rules, default behavior, and common pitfalls, see [Trainer Hook Customization](/core/trainer_hooks).
 
 ### Ranking / CTR
 
@@ -221,10 +223,12 @@ trainer = MatchTrainer(
 import numpy as np
 import torch.nn.functional as F
 
-loss_fns = [
-    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
-    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
-]
+def task_losses(model, x_dict, ys, y_preds):
+    del model, x_dict
+    return [
+        F.binary_cross_entropy(y_preds[:, 0], ys[:, 0].float()),
+        F.binary_cross_entropy(y_preds[:, 1], ys[:, 1].float()),
+    ]
 
 def multitask_metrics(targets, predicts):
     targets = np.asarray(targets)
@@ -238,7 +242,7 @@ def multitask_metrics(targets, predicts):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    loss_fns=loss_fns,
+    compute_task_losses_func=task_losses,
     metric_names=["mae", "mae"],
     compute_metrics=multitask_metrics,
     metric_for_best_model="task_1_mae",
@@ -263,16 +267,17 @@ Used for early stopping when validation performance no longer improves.
 ```python
 from torch_rechub.basic.callback import EarlyStopper
 
-early_stopper = EarlyStopper(patience=10)
+early_stopper = EarlyStopper(patience=10, mode="max")
 
 if early_stopper.stop_training(auc, model.state_dict()):
-    print(f'validation: best auc: {early_stopper.best_auc}')
+    print(f'validation: best score: {early_stopper.best_score}')
     model.load_state_dict(early_stopper.best_weights)
     break
 ```
 
 **Parameters**
 - `patience`: Number of consecutive epochs without improvement before stopping.
+- `mode`: `"max"` for metrics where larger is better, `"min"` for metrics where smaller is better.
 - `delta`: Minimum improvement threshold to be considered progress.
 
 ## Loss Functions

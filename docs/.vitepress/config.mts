@@ -63,7 +63,8 @@ export default defineConfig({
               { text: 'Overview', link: '/core/intro' },
               { text: 'Feature Columns', link: '/core/features' },
               { text: 'Data Pipeline', link: '/core/data' },
-              { text: 'Training & Eval', link: '/core/evaluation' }
+              { text: 'Training & Eval', link: '/core/evaluation' },
+              { text: 'Trainer Hooks', link: '/core/trainer_hooks' }
             ]
           }],
           '/models/': [{
@@ -169,7 +170,8 @@ export default defineConfig({
               { text: '导览 (Overview)', link: '/zh/core/intro' },
               { text: '特征定义 (Features)', link: '/zh/core/features' },
               { text: '数据流水线 (Data)', link: '/zh/core/data' },
-              { text: '训练与评估 (Eval)', link: '/zh/core/evaluation' }
+              { text: '训练与评估 (Eval)', link: '/zh/core/evaluation' },
+              { text: 'Trainer Hook 自定义', link: '/zh/core/trainer_hooks' }
             ]
           }],
           '/zh/models/': [{

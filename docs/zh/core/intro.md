@@ -58,3 +58,5 @@ Torch-RecHub 的核心组件架构如下：
 - **MTLTrainer**：用于训练多任务模型
 
 详情请参考 [训练与评估](/zh/core/evaluation) 页面。
+
+如果你需要自定义 loss、metric、best model 监控逻辑或多任务逐 task loss，请继续参考 [Trainer Hook 自定义](/zh/core/trainer_hooks) 页面。

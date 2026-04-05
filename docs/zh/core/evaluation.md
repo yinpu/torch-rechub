@@ -174,16 +174,18 @@ trainer.export_onnx("mmoe.onnx")
 - `device`：训练设备
 - `gpus`：多GPU列表
 - `model_path`：模型保存路径
-- `loss_fns`：可选的任务损失函数列表，长度必须等于 `len(task_types)`
+- `compute_task_losses_func`：可选的多任务 loss hook，签名为 `compute_task_losses_func(model, x_dict, ys, y_preds)`
 - `evaluate_fns`：可选的逐任务评估函数列表，用于默认评估路径
 - `metric_names`：可选的指标名列表，用于生成 `val/task_0_auc` 这类日志键
-- `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(targets, predicts)`，返回指标字典
+- `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(targets, predicts)`，可返回单个 float 或 `dict[str, float]`
 - `metric_for_best_model`：用于早停和最优模型选择的指标名
 - `greater_is_better`：`metric_for_best_model` 是否“越大越好”
 
 ## 自定义损失函数与评估函数
 
 现在各类 trainer 都支持显式的 hook 式扩展，使用方式和 Hugging Face `Trainer` 的自定义接口类似。
+
+如果你想看完整说明，包括 hook 签名、monitor 规则、默认行为和常见踩坑，请直接看 [Trainer Hook 自定义](/zh/core/trainer_hooks) 页面。
 
 ### 排序 / CTR
 
@@ -232,10 +234,12 @@ trainer = MatchTrainer(
 import numpy as np
 import torch.nn.functional as F
 
-loss_fns = [
-    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
-    lambda y_pred, y_true: F.binary_cross_entropy(y_pred, y_true),
-]
+def task_losses(model, x_dict, ys, y_preds):
+    del model, x_dict
+    return [
+        F.binary_cross_entropy(y_preds[:, 0], ys[:, 0].float()),
+        F.binary_cross_entropy(y_preds[:, 1], ys[:, 1].float()),
+    ]
 
 def multitask_metrics(targets, predicts):
     targets = np.asarray(targets)
@@ -249,7 +253,7 @@ def multitask_metrics(targets, predicts):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    loss_fns=loss_fns,
+    compute_task_losses_func=task_losses,
     metric_names=["mae", "mae"],
     compute_metrics=multitask_metrics,
     metric_for_best_model="task_1_mae",
@@ -275,17 +279,18 @@ trainer = MTLTrainer(
 from torch_rechub.basic.callback import EarlyStopper
 
 # 创建早停器
-early_stopper = EarlyStopper(patience=10)
+early_stopper = EarlyStopper(patience=10, mode="max")
 
 # 在训练过程中使用
 if early_stopper.stop_training(auc, model.state_dict()):
-    print(f'validation: best auc: {early_stopper.best_auc}')
+    print(f'validation: best score: {early_stopper.best_score}')
     model.load_state_dict(early_stopper.best_weights)
     break
 ```
 
 **参数说明：**
 - `patience`：早停耐心值，即连续多少轮验证集性能没有提升就停止训练
+- `mode`：`"max"` 表示指标越大越好，`"min"` 表示指标越小越好
 - `delta`：性能提升阈值，即性能提升超过该值才被认为是有效提升
 
 ## 损失函数

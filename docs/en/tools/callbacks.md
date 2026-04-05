@@ -9,11 +9,11 @@ Callbacks are tools that perform specific operations during training, used to im
 
 ## EarlyStopper
 
-EarlyStopper is an early stopping utility that stops training when validation performance stops improving, preventing overfitting and saving training time.
+EarlyStopper is an early stopping utility that stops training when a monitored validation score stops improving.
 
 ### Features
 
-- Monitor validation metrics (e.g., AUC)
+- Monitor validation metrics such as AUC, logloss, MSE, or MAE
 - Trigger early stopping when metrics don't improve for consecutive epochs
 - Automatically save best model weights
 
@@ -22,8 +22,8 @@ EarlyStopper is an early stopping utility that stops training when validation pe
 ```python
 from torch_rechub.basic.callback import EarlyStopper
 
-# Create early stopper
-early_stopper = EarlyStopper(patience=10)
+# Create early stopper for a metric where larger is better
+early_stopper = EarlyStopper(patience=10, mode="max")
 
 # Use in training loop
 for epoch in range(n_epoch):
@@ -36,7 +36,7 @@ for epoch in range(n_epoch):
     # Check if early stopping is needed
     if early_stopper.stop_training(val_auc, model.state_dict()):
         print(f'Early stopping at epoch {epoch}')
-        print(f'Best validation AUC: {early_stopper.best_auc}')
+        print(f'Best validation score: {early_stopper.best_score}')
         # Restore best weights
         model.load_state_dict(early_stopper.best_weights)
         break
@@ -47,23 +47,26 @@ for epoch in range(n_epoch):
 | Parameter | Type | Description | Default |
 | --- | --- | --- | --- |
 | `patience` | int | Early stopping patience, i.e., how many consecutive epochs without improvement before stopping | Required |
+| `mode` | str | `"max"` when larger is better, `"min"` when smaller is better | `"max"` |
+| `delta` | float | Minimum improvement required to reset the patience counter | `0.0` |
 
 ### Attributes
 
 | Attribute | Type | Description |
 | --- | --- | --- |
-| `best_auc` | float | Best recorded validation AUC |
+| `best_score` | float | Best recorded validation score |
+| `best_auc` | float | Backward-compatible alias of the best score |
 | `best_weights` | dict | Deep copy of best model weights |
 | `trial_counter` | int | Current count of consecutive epochs without improvement |
 
 ### Methods
 
-#### stop_training(val_auc, weights)
+#### stop_training(score, weights)
 
 Determine whether to stop training.
 
 **Parameters:**
-- `val_auc` (float): Current validation AUC score
+- `score` (float): Current validation score in the monitored direction
 - `weights` (dict): Current model weights (`model.state_dict()`)
 
 **Returns:**
@@ -114,7 +117,7 @@ trainer = CTRTrainer(
 trainer.fit(train_dl, val_dl)
 
 # Method 2: Manual EarlyStopper usage
-early_stopper = EarlyStopper(patience=10)
+early_stopper = EarlyStopper(patience=10, mode="max")
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 for epoch in range(50):
@@ -133,9 +136,15 @@ for epoch in range(50):
 
     # Early stopping check
     if early_stopper.stop_training(val_auc, model.state_dict()):
-        print(f"Early stopping! Best AUC: {early_stopper.best_auc:.4f}")
+        print(f"Early stopping! Best score: {early_stopper.best_score:.4f}")
         model.load_state_dict(early_stopper.best_weights)
         break
+```
+
+For metrics where smaller is better, switch to `mode="min"`:
+
+```python
+early_stopper = EarlyStopper(patience=10, mode="min")
 ```
 
 ## Best Practices
@@ -152,4 +161,3 @@ for epoch in range(50):
 3. **Save checkpoints**:
    - Early stopper automatically saves best weights
    - Also recommend using `model_path` parameter to save model to disk
-

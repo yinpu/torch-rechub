@@ -9,11 +9,11 @@ description: Torch-RecHub 训练回调函数
 
 ## EarlyStopper
 
-EarlyStopper 是一个早停器，用于在验证集性能不再提升时停止训练，防止过拟合并节省训练时间。
+EarlyStopper 是一个早停器，用于在被监控的验证指标不再提升时停止训练。
 
 ### 功能描述
 
-- 监控验证集指标（如 AUC）
+- 监控验证集指标，如 AUC、logloss、MSE、MAE
 - 当指标连续多轮没有提升时触发早停
 - 自动保存最佳模型权重
 
@@ -22,8 +22,8 @@ EarlyStopper 是一个早停器，用于在验证集性能不再提升时停止�
 ```python
 from torch_rechub.basic.callback import EarlyStopper
 
-# 创建早停器
-early_stopper = EarlyStopper(patience=10)
+# 创建早停器，适用于“越大越好”的指标
+early_stopper = EarlyStopper(patience=10, mode="max")
 
 # 在训练循环中使用
 for epoch in range(n_epoch):
@@ -36,7 +36,7 @@ for epoch in range(n_epoch):
     # 检查是否需要早停
     if early_stopper.stop_training(val_auc, model.state_dict()):
         print(f'Early stopping at epoch {epoch}')
-        print(f'Best validation AUC: {early_stopper.best_auc}')
+        print(f'Best validation score: {early_stopper.best_score}')
         # 恢复最佳权重
         model.load_state_dict(early_stopper.best_weights)
         break
@@ -47,23 +47,26 @@ for epoch in range(n_epoch):
 | 参数 | 类型 | 描述 | 默认值 |
 | --- | --- | --- | --- |
 | `patience` | int | 早停耐心值，即连续多少轮验证集性能没有提升就停止训练 | 必需 |
+| `mode` | str | `"max"` 表示越大越好，`"min"` 表示越小越好 | `"max"` |
+| `delta` | float | 只有超过该阈值的提升才会重置 patience 计数 | `0.0` |
 
 ### 属性说明
 
 | 属性 | 类型 | 描述 |
 | --- | --- | --- |
-| `best_auc` | float | 记录的最佳验证集 AUC |
+| `best_score` | float | 记录的最佳验证分数 |
+| `best_auc` | float | 为兼容旧代码保留的最佳分数字段别名 |
 | `best_weights` | dict | 最佳模型权重的深拷贝 |
 | `trial_counter` | int | 当前连续未提升的轮数 |
 
 ### 方法说明
 
-#### stop_training(val_auc, weights)
+#### stop_training(score, weights)
 
 判断是否需要停止训练。
 
 **参数：**
-- `val_auc` (float): 当前验证集 AUC 分数
+- `score` (float): 当前被监控方向上的验证分数
 - `weights` (dict): 当前模型权重（`model.state_dict()`）
 
 **返回值：**
@@ -114,7 +117,7 @@ trainer = CTRTrainer(
 trainer.fit(train_dl, val_dl)
 
 # 方式二：手动使用 EarlyStopper
-early_stopper = EarlyStopper(patience=10)
+early_stopper = EarlyStopper(patience=10, mode="max")
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 for epoch in range(50):
@@ -133,9 +136,15 @@ for epoch in range(50):
 
     # 早停检查
     if early_stopper.stop_training(val_auc, model.state_dict()):
-        print(f"Early stopping! Best AUC: {early_stopper.best_auc:.4f}")
+        print(f"Early stopping! Best score: {early_stopper.best_score:.4f}")
         model.load_state_dict(early_stopper.best_weights)
         break
+```
+
+如果你监控的是 `logloss`、`mae`、`rmse` 这类“越小越好”的指标，需要改成：
+
+```python
+early_stopper = EarlyStopper(patience=10, mode="min")
 ```
 
 ## 最佳实践
@@ -152,4 +161,3 @@ for epoch in range(50):
 3. **保存检查点**：
    - 早停器会自动保存最佳权重
    - 建议同时使用 `model_path` 参数保存模型到磁盘
-
