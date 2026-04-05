@@ -66,9 +66,11 @@ class CountingBinaryLoss(object):
 
     def __init__(self):
         self.calls = 0
+        self.last_dtype = None
 
     def __call__(self, model, x_dict, y):
         self.calls += 1
+        self.last_dtype = y.dtype
         y_pred = model(x_dict)
         return F.binary_cross_entropy(y_pred, y)
 
@@ -128,6 +130,13 @@ def build_ctr_dataloader():
     """Create a deterministic single-task dataloader."""
     x = torch.linspace(-1.0, 1.0, steps=16).view(-1, 1)
     y = (x > 0).float()
+    return DataLoader(DictDataset({"x": x}, y), batch_size=4, shuffle=False)
+
+
+def build_ctr_int_label_dataloader():
+    """Create a deterministic point-wise dataloader with integer labels."""
+    x = torch.linspace(-1.0, 1.0, steps=16).view(-1, 1)
+    y = (x > 0).long()
     return DataLoader(DictDataset({"x": x}, y), batch_size=4, shuffle=False)
 
 
@@ -278,6 +287,28 @@ def test_match_trainer_supports_custom_pairwise_loss():
         assert loss_hook.calls > 0
 
 
+def test_match_trainer_prepares_targets_for_custom_pointwise_loss():
+    """Custom point-wise losses should receive float labels like the built-in BCE path."""
+    dataloader = build_ctr_int_label_dataloader()
+    loss_hook = CountingBinaryLoss()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MatchTrainer(
+            model=BinaryModel(),
+            mode=0,
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_loss_func=loss_hook,
+        )
+
+        trainer.train_one_epoch(dataloader)
+
+        assert loss_hook.calls > 0
+        assert loss_hook.last_dtype == torch.float32
+
+
 def test_match_trainer_rejects_custom_monitor_without_custom_metrics():
     """Default matching evaluator should not relabel AUC as another metric."""
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -375,6 +406,24 @@ def test_mtl_trainer_infers_default_monitor_from_custom_metric_names():
 
         assert trainer.metric_for_best_model == "task_0_logloss"
         assert trainer.early_stopper.mode == "min"
+
+
+def test_mtl_trainer_infers_monitor_direction_from_monitored_task():
+    """Monitor direction should follow the task named in metric_for_best_model."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["regression", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            earlystop_taskid=0,
+            device="cpu",
+            model_path=temp_dir,
+            metric_for_best_model="task_1_auc",
+        )
+
+        assert trainer.greater_is_better is True
+        assert trainer.early_stopper.mode == "max"
 
 
 def test_mtl_trainer_preserves_task_ids_for_partial_metric_dicts():

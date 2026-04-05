@@ -1,4 +1,5 @@
 import os
+import re
 
 import numpy as np
 import torch
@@ -124,7 +125,8 @@ class MTLTrainer(object):
             metric_for_best_model = f"task_{earlystop_taskid}_{self.metric_names[earlystop_taskid]}"
         self.metric_for_best_model = metric_for_best_model
         if greater_is_better is None:
-            greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, task_types[earlystop_taskid])
+            monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, earlystop_taskid)
+            greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
         self.greater_is_better = greater_is_better
         self.n_epoch = n_epoch
         self.earlystop_taskid = earlystop_taskid
@@ -307,6 +309,15 @@ class MTLTrainer(object):
         if task_type == "regression":
             return False
         return True
+
+    def _infer_monitor_task_type(self, metric_name, default_task_id):
+        """Resolve the task type associated with the monitored metric."""
+        match = re.match(r"task_(\d+)_", metric_name)
+        if match:
+            task_id = int(match.group(1))
+            if 0 <= task_id < self.n_task:
+                return self.task_types[task_id]
+        return self.task_types[default_task_id]
 
     def _compute_default_task_losses(self, model, x_dict, ys, y_preds):
         """Compute the built-in per-task losses."""

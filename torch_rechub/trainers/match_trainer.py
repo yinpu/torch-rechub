@@ -241,7 +241,6 @@ class MatchTrainer(object):
 
     def _compute_default_loss(self, x_dict, y):
         """Compute task loss before regularization using built-in training modes."""
-        y = self._prepare_target(y)
         if self.in_batch_neg:
             base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
             user_embedding = base_model.user_tower(x_dict)
@@ -271,6 +270,7 @@ class MatchTrainer(object):
 
     def _compute_batch_loss(self, x_dict, y):
         """Compute task loss before regularization."""
+        y = self._prepare_target(y)
         if self.compute_loss_func is not None:
             return self.compute_loss_func(self.model, x_dict, y)
         return self._compute_default_loss(x_dict, y)
