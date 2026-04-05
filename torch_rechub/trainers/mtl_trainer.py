@@ -296,10 +296,9 @@ class MTLTrainer(object):
 
     def _infer_greater_is_better(self, metric_name, task_type):
         """Infer whether larger metric values indicate better models."""
+        del task_type
         metric_name = metric_name.lower()
         if any(loss_name in metric_name for loss_name in ["loss", "mse", "mae", "rmse", "error", "logloss", "log_loss"]):
-            return False
-        if task_type == "regression":
             return False
         return True
 
@@ -373,14 +372,11 @@ class MTLTrainer(object):
             if scalar_output:
                 self.metric_for_best_model = "metric"
             else:
-                if len(metrics) != 1:
-                    raise ValueError(
-                        "Custom compute_metrics returned multiple metrics. "
-                        "Set metric_for_best_model to one of: "
-                        f"{sorted(metrics.keys())}"
-                    )
-                self.metric_for_best_model = next(iter(metrics))
-        if self._should_infer_monitor_direction:
+                if len(metrics) == 1:
+                    self.metric_for_best_model = next(iter(metrics))
+                else:
+                    return
+        if self._should_infer_monitor_direction and self.metric_for_best_model is not None:
             if scalar_output and self.metric_for_best_model == "metric":
                 self.greater_is_better = False
             else:
@@ -396,6 +392,12 @@ class MTLTrainer(object):
 
     def _get_monitor_value(self, metrics):
         """Extract the score tracked by early stopping and model selection."""
+        if self.metric_for_best_model is None:
+            raise ValueError(
+                "Custom compute_metrics returned multiple metrics. "
+                "Set metric_for_best_model to one of: "
+                f"{sorted(metrics.keys())}"
+            )
         if self.metric_for_best_model not in metrics:
             raise ValueError(
                 f"metric_for_best_model={self.metric_for_best_model!r} was not found in evaluation metrics: {sorted(metrics.keys())}"

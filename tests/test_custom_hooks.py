@@ -185,6 +185,19 @@ def multitask_partial_metrics(targets, predicts):
     return {"task_1_mae": float(mae)}
 
 
+def multitask_regression_metrics(targets, predicts):
+    """Return custom metrics including a maximize-style regression score."""
+    targets = np.asarray(targets)
+    predicts = np.asarray(predicts)
+    residual = np.square(targets[:, 0] - predicts[:, 0]).mean()
+    r2 = 1.0 - float(residual)
+    mae = np.abs(targets[:, 1] - predicts[:, 1]).mean()
+    return {
+        "task_0_r2": r2,
+        "task_1_mae": float(mae),
+    }
+
+
 def binary_logloss(y_true, y_pred):
     """Return scalar logloss for custom evaluator tests."""
     y_true = np.asarray(y_true).reshape(-1)
@@ -493,6 +506,29 @@ def test_mtl_trainer_scalar_custom_metric_defaults_to_min_monitor():
         assert trainer.early_stopper.mode == "min"
 
 
+def test_mtl_trainer_allows_multi_metric_inspection_before_monitor_selection():
+    """Multi-metric hooks should be inspectable before choosing a monitor."""
+    dataloader = build_mtl_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=multitask_mae_metrics,
+        )
+
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+
+        assert set(metrics) == {"task_0_mae", "task_1_mae"}
+        assert trainer.metric_for_best_model is None
+        with pytest.raises(ValueError, match="Set metric_for_best_model to one of"):
+            trainer.evaluate(trainer.model, dataloader, return_dict=False)
+
+
 def test_mtl_trainer_infers_monitor_direction_from_monitored_task():
     """Monitor direction should follow the task named in metric_for_best_model."""
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -505,6 +541,25 @@ def test_mtl_trainer_infers_monitor_direction_from_monitored_task():
             device="cpu",
             model_path=temp_dir,
             metric_for_best_model="task_1_auc",
+        )
+
+        assert trainer.greater_is_better is True
+        assert trainer.early_stopper.mode == "max"
+
+
+def test_mtl_trainer_infers_regression_monitor_direction_from_metric_name():
+    """Regression custom metrics should still infer maximize-style names correctly."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["regression", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            earlystop_taskid=0,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=multitask_regression_metrics,
+            metric_for_best_model="task_0_r2",
         )
 
         assert trainer.greater_is_better is True
