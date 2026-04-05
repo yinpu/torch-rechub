@@ -260,6 +260,7 @@ trainer = MTLTrainer(
 
 注意：
 - `compute_metrics` 可以返回单个 float，也可以返回指标字典。
+- 对 `MTLTrainer` 来说，自定义 metric 字典会按原样写入验证日志。`task_{id}_...` 只是便于你自己分析的命名约定。
 - 当 `compute_metrics` 返回单个 float 且未显式传入 monitor 配置时，trainer 会将其记录为 `metric`，并默认按 `greater_is_better=False` 处理。
 - 当返回多个指标时，`metric_for_best_model` 必须对应其中一个 key。
 - 对于 `loss`、`logloss`、`mse`、`mae`、`rmse` 这类越小越好的指标，需要设置 `greater_is_better=False`。

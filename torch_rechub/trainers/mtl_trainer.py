@@ -202,14 +202,6 @@ class MTLTrainer(object):
             monitor_value = self._get_monitor_value(metrics)
             print('epoch:', epoch_i, 'validation metrics:', metrics)
 
-            for task_id, metric_key, score in self._task_metric_values(metrics):
-                if score is None:
-                    _log_per_epoch.append(float("nan"))
-                    continue
-                if metric_key is not None:
-                    logs[f'val/{metric_key}'] = score
-                _log_per_epoch.append(score)
-
             for name, value in metrics.items():
                 logs[f'val/{name}'] = value
             if self.metric_for_best_model == "auc" or self.metric_for_best_model.endswith("_auc"):
@@ -221,7 +213,7 @@ class MTLTrainer(object):
                 for task_id, weight in enumerate(self.loss_weight):
                     logs[f'loss_weight/task_{task_id}'] = weight.item()
 
-            total_log.append(_log_per_epoch)
+            total_log.append(dict(logs))
 
             # Log metrics once per epoch
             for logger in self._iter_loggers():
@@ -413,30 +405,6 @@ class MTLTrainer(object):
     def _default_metric_keys(self):
         """Return the built-in metric keys exposed by default evaluation."""
         return [self._default_metric_key(task_id) for task_id in range(self.n_task)]
-
-    def _select_task_metric_key(self, task_id, metrics):
-        """Pick the representative metric key for a task from ``metrics``."""
-        default_key = self._default_metric_key(task_id)
-        if default_key in metrics:
-            return default_key
-
-        prefix = f"task_{task_id}_"
-        candidate_keys = [name for name in metrics if name.startswith(prefix)]
-        if not candidate_keys:
-            return None
-        if self.metric_for_best_model in candidate_keys:
-            return self.metric_for_best_model
-        if len(candidate_keys) == 1:
-            return candidate_keys[0]
-        return sorted(candidate_keys)[0]
-
-    def _task_metric_values(self, metrics):
-        """Return per-task metric values in task order with task ids preserved."""
-        values = []
-        for task_id in range(self.n_task):
-            key = self._select_task_metric_key(task_id, metrics)
-            values.append((task_id, key, metrics.get(key) if key is not None else None))
-        return values
 
     def _evaluate_metrics(self, model, data_loader):
         """Collect predictions on ``data_loader`` and compute metrics."""

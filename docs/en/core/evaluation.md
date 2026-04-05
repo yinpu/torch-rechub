@@ -249,6 +249,7 @@ trainer = MTLTrainer(
 
 Notes:
 - `compute_metrics` should return a single float or a metric dict.
+- For `MTLTrainer`, custom metric dict keys are logged as returned. Use `task_{id}_...` only if that naming helps your own analysis.
 - When `compute_metrics` returns a single float and you do not pass monitor settings, trainers will track it as `metric` with `greater_is_better=False`.
 - `metric_for_best_model` must match one key from the metric dict when multiple metrics are returned.
 - Use `greater_is_better=False` for metrics such as `loss`, `logloss`, `mse`, `mae`, or `rmse`.

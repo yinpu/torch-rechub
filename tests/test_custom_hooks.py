@@ -505,8 +505,8 @@ def test_mtl_trainer_infers_monitor_direction_from_monitored_task():
         assert trainer.early_stopper.mode == "max"
 
 
-def test_mtl_trainer_preserves_task_ids_for_partial_metric_dicts():
-    """Partial metric dicts should not be reindexed onto lower task ids."""
+def test_mtl_trainer_fit_returns_structured_metric_logs():
+    """MTLTrainer.fit should return per-epoch log dicts without task-slot padding."""
     dataloader = build_mtl_dataloader()
     logger = RecordingLogger()
 
@@ -527,8 +527,10 @@ def test_mtl_trainer_preserves_task_ids_for_partial_metric_dicts():
         total_log = trainer.fit(dataloader, dataloader)
         metric_logs = [payload for kind, _, payload in logger.history if kind == "metrics"]
 
-        assert np.isnan(total_log[0][2])
-        assert isinstance(total_log[0][3], float)
-        assert "val/task_0_score" not in metric_logs[-1]
-        assert "val/task_1_score" not in metric_logs[-1]
-        assert "val/task_1_mae" in metric_logs[-1]
+        assert isinstance(total_log[0], dict)
+        assert "train/task_0_loss" in total_log[0]
+        assert "train/task_1_loss" in total_log[0]
+        assert "val/task_1_mae" in total_log[0]
+        assert "val/task_0_score" not in total_log[0]
+        assert "val/task_1_score" not in total_log[0]
+        assert total_log[0]["val/task_1_mae"] == metric_logs[-1]["val/task_1_mae"]

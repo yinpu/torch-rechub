@@ -192,6 +192,8 @@ metric_for_best_model="logloss"
 greater_is_better=False
 ```
 
+For `MTLTrainer`, custom metric dict keys are logged directly. `task_{id}_...` naming is optional.
+
 ### Direction inference
 
 If you omit `greater_is_better`, the trainers infer it from the metric name:

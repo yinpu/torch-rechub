@@ -279,6 +279,8 @@ greater_is_better=False
 
 否则当返回多个 key 时，Trainer 无法可靠判断你到底想监控哪个指标。
 
+对 `MTLTrainer` 来说，自定义 metric 字典的 key 会直接进入日志，`task_{id}_...` 命名只是可选约定。
+
 ### 4. `greater_is_better` 的自动推断
 
 如果你传了 `metric_for_best_model`，但没传 `greater_is_better`，Trainer 会根据名字推断方向：
