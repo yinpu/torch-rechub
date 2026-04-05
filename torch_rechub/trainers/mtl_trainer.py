@@ -350,6 +350,10 @@ class MTLTrainer(object):
             metrics[metric_name] = float(self.task_metric_fns[task_id](targets[:, task_id], predicts[:, task_id]))
         return metrics
 
+    def _legacy_default_scores(self, metrics):
+        """Return built-in metrics in the pre-hook task order."""
+        return [metrics[name] for name in self._default_metric_keys()]
+
     def _normalize_metrics(self, metrics, default_name):
         """Normalize custom metric output to ``dict[str, float]``."""
         if isinstance(metrics, dict):
@@ -434,18 +438,22 @@ class MTLTrainer(object):
             data_loader (DataLoader): evaluation data loader.
             return_dict (bool, optional): when ``True``, return a metric dict.
                 When ``False``, return the scalar selected by
-                ``metric_for_best_model``. Defaults to ``True`` only when a
-                custom ``compute_metrics`` hook is configured.
+                ``metric_for_best_model``. When unset, the built-in evaluator
+                returns the legacy per-task score list and custom
+                ``compute_metrics`` hooks return a metric dict.
 
         Returns:
-            float or dict[str, float]: scalar monitor metric or a metric dict.
+            list[float] or float or dict[str, float]: legacy per-task scores,
+            scalar monitor metric, or a metric dict.
         """
-        if return_dict is None:
-            return_dict = self.compute_metrics is not None
         metrics = self._evaluate_metrics(model, data_loader)
         if return_dict:
             return metrics
-        return self._get_monitor_value(metrics)
+        if return_dict is False:
+            return self._get_monitor_value(metrics)
+        if self.compute_metrics is None:
+            return self._legacy_default_scores(metrics)
+        return metrics
 
     def predict(self, model, data_loader):
         model.eval()

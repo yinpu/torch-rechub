@@ -396,10 +396,12 @@ def test_mtl_trainer_supports_custom_losses_and_metrics():
         )
 
         trainer.fit(dataloader, dataloader)
+        default_metrics = trainer.evaluate(trainer.model, dataloader)
         metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
         scalar_score = trainer.evaluate(trainer.model, dataloader, return_dict=False)
 
         assert loss_hook.calls > 0
+        assert default_metrics == metrics
         assert "task_0_mae" in metrics
         assert "task_1_mae" in metrics
         assert isinstance(metrics["task_1_mae"], float)
@@ -441,8 +443,8 @@ def test_mtl_trainer_validates_custom_task_loss_count():
             trainer.train_one_epoch(dataloader)
 
 
-def test_mtl_trainer_uses_default_task_monitor_without_custom_metrics():
-    """Built-in MTL evaluation should default to the monitored task metric key."""
+def test_mtl_trainer_default_evaluate_returns_legacy_task_scores():
+    """Built-in MTL evaluation should keep returning per-task scores by default."""
     dataloader = build_mtl_dataloader()
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -455,11 +457,15 @@ def test_mtl_trainer_uses_default_task_monitor_without_custom_metrics():
             model_path=temp_dir,
         )
 
+        default_scores = trainer.evaluate(trainer.model, dataloader)
         metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
         scalar_score = trainer.evaluate(trainer.model, dataloader, return_dict=False)
 
         assert trainer.metric_for_best_model == "task_0_auc"
         assert trainer.early_stopper.mode == "max"
+        assert isinstance(default_scores, list)
+        assert len(default_scores) == 2
+        assert default_scores == [metrics["task_0_auc"], metrics["task_1_auc"]]
         assert isinstance(scalar_score, float)
         assert scalar_score == metrics["task_0_auc"]
 
