@@ -59,8 +59,8 @@ class MatchTrainer(object):
         model_logger=None,
         compute_loss_func=None,
         compute_metrics=None,
-        metric_for_best_model="auc",
-        greater_is_better=True,
+        metric_for_best_model=None,
+        greater_is_better=None,
     ):
         self.model = model  # for uniform weights save method in one gpu or multi gpu
         if gpus is None:
@@ -111,11 +111,13 @@ class MatchTrainer(object):
         self.compute_metrics = compute_metrics
         self.metric_for_best_model = metric_for_best_model
         self.greater_is_better = greater_is_better
+        self._should_infer_monitor_direction = greater_is_better is None
         self._validate_metric_configuration()
+        self._initialize_metric_configuration()
         self.n_epoch = n_epoch
         self.early_stopper = EarlyStopper(
             patience=earlystop_patience,
-            mode="max" if greater_is_better else "min",
+            mode="max" if self.greater_is_better else "min",
         )
         self.model_path = model_path
         # Initialize regularization loss
@@ -295,12 +297,68 @@ class MatchTrainer(object):
     def _normalize_metrics(self, metrics, default_name):
         """Normalize custom metric output to ``dict[str, float]``."""
         if isinstance(metrics, dict):
-            return {str(name): float(value) for name, value in metrics.items()}
-        return {default_name: float(metrics)}
+            normalized_metrics = {str(name): float(value) for name, value in metrics.items()}
+            self._resolve_custom_metric_configuration(normalized_metrics, scalar_output=False)
+            return normalized_metrics
+        metric_name = default_name or "metric"
+        normalized_metrics = {metric_name: float(metrics)}
+        self._resolve_custom_metric_configuration(normalized_metrics, scalar_output=True)
+        return normalized_metrics
+
+    def _initialize_metric_configuration(self):
+        """Resolve monitor defaults before training starts."""
+        if self.compute_metrics is None:
+            if self.metric_for_best_model is None:
+                self.metric_for_best_model = "auc"
+            if self.greater_is_better is None:
+                self.greater_is_better = True
+            self._should_infer_monitor_direction = False
+            return
+        if self.greater_is_better is None and self.metric_for_best_model is not None:
+            self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model)
+            self._should_infer_monitor_direction = False
+        elif self.greater_is_better is None:
+            # Unnamed scalar custom metrics default to minimizing until a name is resolved.
+            self.greater_is_better = False
+
+    def _resolve_custom_metric_configuration(self, metrics, scalar_output):
+        """Finalize monitor name and direction for custom metric outputs."""
+        if self.compute_metrics is None:
+            return
+        if self.metric_for_best_model is None:
+            if scalar_output:
+                self.metric_for_best_model = "metric"
+            else:
+                if len(metrics) != 1:
+                    raise ValueError(
+                        "Custom compute_metrics returned multiple metrics. "
+                        "Set metric_for_best_model to one of: "
+                        f"{sorted(metrics.keys())}"
+                    )
+                self.metric_for_best_model = next(iter(metrics))
+        if self._should_infer_monitor_direction:
+            if scalar_output and self.metric_for_best_model == "metric":
+                self.greater_is_better = False
+            else:
+                self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model)
+            self._should_infer_monitor_direction = False
+            self._sync_early_stopper_mode()
+
+    def _infer_greater_is_better(self, metric_name):
+        """Infer whether larger metric values indicate better models."""
+        metric_name = metric_name.lower()
+        if any(loss_name in metric_name for loss_name in ["loss", "mse", "mae", "rmse", "error", "logloss", "log_loss"]):
+            return False
+        return True
+
+    def _sync_early_stopper_mode(self):
+        """Keep the early stopper aligned with the active monitor direction."""
+        if hasattr(self, "early_stopper"):
+            self.early_stopper.mode = "max" if self.greater_is_better else "min"
 
     def _validate_metric_configuration(self):
         """Reject monitor names unsupported by the built-in evaluator."""
-        if self.compute_metrics is None and self.metric_for_best_model != "auc":
+        if self.compute_metrics is None and self.metric_for_best_model not in {None, "auc"}:
             raise ValueError(
                 "MatchTrainer default evaluation only returns 'auc'. "
                 "Pass compute_metrics to monitor a different metric."

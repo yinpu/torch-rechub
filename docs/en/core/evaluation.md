@@ -248,6 +248,7 @@ trainer = MTLTrainer(
 
 Notes:
 - `compute_metrics` should return a single float or a metric dict.
+- When `compute_metrics` returns a single float and you do not pass monitor settings, trainers will track it as `metric` with `greater_is_better=False`.
 - `metric_for_best_model` must match one key from the metric dict when multiple metrics are returned.
 - Use `greater_is_better=False` for metrics such as `loss`, `logloss`, `mse`, `mae`, or `rmse`.
 - Without `compute_metrics`, `CTRTrainer` and `MatchTrainer` only expose the built-in `auc` metric, so custom monitor names are not supported on the default evaluator.

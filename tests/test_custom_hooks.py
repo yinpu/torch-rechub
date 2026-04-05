@@ -193,6 +193,13 @@ def binary_logloss(y_true, y_pred):
     return float(-(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)).mean())
 
 
+def multitask_scalar_mae(targets, predicts):
+    """Return a single scalar MAE across all tasks."""
+    targets = np.asarray(targets)
+    predicts = np.asarray(predicts)
+    return float(np.abs(targets - predicts).mean())
+
+
 def test_early_stopper_supports_min_mode():
     """EarlyStopper should support metrics where smaller values are better."""
     stopper = EarlyStopper(patience=2, mode="min")
@@ -249,6 +256,28 @@ def test_ctr_trainer_default_evaluate_remains_scalar():
         score = trainer.evaluate(trainer.model, dataloader)
 
         assert isinstance(score, float)
+
+
+def test_ctr_trainer_scalar_custom_metric_defaults_to_min_monitor():
+    """Scalar custom metrics should no longer inherit the built-in AUC monitor."""
+    dataloader = build_ctr_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = CTRTrainer(
+            model=BinaryModel(),
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=binary_logloss,
+        )
+
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+
+        assert set(metrics) == {"metric"}
+        assert trainer.metric_for_best_model == "metric"
+        assert trainer.greater_is_better is False
+        assert trainer.early_stopper.mode == "min"
 
 
 def test_ctr_trainer_rejects_custom_monitor_without_custom_metrics():
@@ -322,6 +351,29 @@ def test_match_trainer_rejects_custom_monitor_without_custom_metrics():
                 metric_for_best_model="logloss",
                 greater_is_better=False,
             )
+
+
+def test_match_trainer_scalar_custom_metric_defaults_to_min_monitor():
+    """Scalar custom metrics should not inherit the built-in AUC monitor."""
+    dataloader = build_ctr_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MatchTrainer(
+            model=BinaryModel(),
+            mode=0,
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=binary_logloss,
+        )
+
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+
+        assert set(metrics) == {"metric"}
+        assert trainer.metric_for_best_model == "metric"
+        assert trainer.greater_is_better is False
+        assert trainer.early_stopper.mode == "min"
 
 
 def test_mtl_trainer_supports_custom_losses_and_metrics():
@@ -405,6 +457,29 @@ def test_mtl_trainer_infers_default_monitor_from_custom_metric_names():
         )
 
         assert trainer.metric_for_best_model == "task_0_logloss"
+        assert trainer.early_stopper.mode == "min"
+
+
+def test_mtl_trainer_scalar_custom_metric_defaults_to_min_monitor():
+    """Scalar MTL metrics should not inherit task-default AUC-style monitoring."""
+    dataloader = build_mtl_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=multitask_scalar_mae,
+        )
+
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+
+        assert set(metrics) == {"metric"}
+        assert trainer.metric_for_best_model == "metric"
+        assert trainer.greater_is_better is False
         assert trainer.early_stopper.mode == "min"
 
 

@@ -259,6 +259,7 @@ trainer = MTLTrainer(
 
 注意：
 - `compute_metrics` 可以返回单个 float，也可以返回指标字典。
+- 当 `compute_metrics` 返回单个 float 且未显式传入 monitor 配置时，trainer 会将其记录为 `metric`，并默认按 `greater_is_better=False` 处理。
 - 当返回多个指标时，`metric_for_best_model` 必须对应其中一个 key。
 - 对于 `loss`、`logloss`、`mse`、`mae`、`rmse` 这类越小越好的指标，需要设置 `greater_is_better=False`。
 - 当未提供 `compute_metrics` 时，`CTRTrainer` 和 `MatchTrainer` 的默认评估只会产出内置的 `auc`，因此不支持自定义 monitor 名称。

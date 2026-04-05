@@ -121,18 +121,15 @@ class MTLTrainer(object):
         self.compute_metrics = compute_metrics
         self._validate_metric_configuration(metric_names, evaluate_fns)
         self.metric_names = self._init_metric_names(task_types, metric_names)
-        if metric_for_best_model is None:
-            metric_for_best_model = f"task_{earlystop_taskid}_{self.metric_names[earlystop_taskid]}"
         self.metric_for_best_model = metric_for_best_model
-        if greater_is_better is None:
-            monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, earlystop_taskid)
-            greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
         self.greater_is_better = greater_is_better
+        self._should_infer_monitor_direction = greater_is_better is None
+        self._initialize_metric_configuration(earlystop_taskid)
         self.n_epoch = n_epoch
         self.earlystop_taskid = earlystop_taskid
         self.early_stopper = EarlyStopper(
             patience=earlystop_patience,
-            mode="max" if greater_is_better else "min",
+            mode="max" if self.greater_is_better else "min",
         )
 
         self.gpus = gpus
@@ -301,6 +298,24 @@ class MTLTrainer(object):
                 "Custom evaluate_fns require matching metric_names when compute_metrics is not provided."
             )
 
+    def _initialize_metric_configuration(self, default_task_id):
+        """Resolve monitor defaults before training starts."""
+        if self.compute_metrics is None:
+            if self.metric_for_best_model is None:
+                self.metric_for_best_model = f"task_{default_task_id}_{self.metric_names[default_task_id]}"
+            if self.greater_is_better is None:
+                monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, default_task_id)
+                self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
+            self._should_infer_monitor_direction = False
+            return
+        if self.greater_is_better is None and self.metric_for_best_model is not None:
+            monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, default_task_id)
+            self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
+            self._should_infer_monitor_direction = False
+        elif self.greater_is_better is None:
+            # Unnamed scalar custom metrics default to minimizing until a name is resolved.
+            self.greater_is_better = False
+
     def _infer_greater_is_better(self, metric_name, task_type):
         """Infer whether larger metric values indicate better models."""
         metric_name = metric_name.lower()
@@ -360,8 +375,42 @@ class MTLTrainer(object):
     def _normalize_metrics(self, metrics, default_name):
         """Normalize custom metric output to ``dict[str, float]``."""
         if isinstance(metrics, dict):
-            return {str(name): float(value) for name, value in metrics.items()}
-        return {default_name: float(metrics)}
+            normalized_metrics = {str(name): float(value) for name, value in metrics.items()}
+            self._resolve_custom_metric_configuration(normalized_metrics, scalar_output=False)
+            return normalized_metrics
+        metric_name = default_name or "metric"
+        normalized_metrics = {metric_name: float(metrics)}
+        self._resolve_custom_metric_configuration(normalized_metrics, scalar_output=True)
+        return normalized_metrics
+
+    def _resolve_custom_metric_configuration(self, metrics, scalar_output):
+        """Finalize monitor name and direction for custom metric outputs."""
+        if self.compute_metrics is None:
+            return
+        if self.metric_for_best_model is None:
+            if scalar_output:
+                self.metric_for_best_model = "metric"
+            else:
+                if len(metrics) != 1:
+                    raise ValueError(
+                        "Custom compute_metrics returned multiple metrics. "
+                        "Set metric_for_best_model to one of: "
+                        f"{sorted(metrics.keys())}"
+                    )
+                self.metric_for_best_model = next(iter(metrics))
+        if self._should_infer_monitor_direction:
+            if scalar_output and self.metric_for_best_model == "metric":
+                self.greater_is_better = False
+            else:
+                monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, self.earlystop_taskid)
+                self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
+            self._should_infer_monitor_direction = False
+            self._sync_early_stopper_mode()
+
+    def _sync_early_stopper_mode(self):
+        """Keep the early stopper aligned with the active monitor direction."""
+        if hasattr(self, "early_stopper"):
+            self.early_stopper.mode = "max" if self.greater_is_better else "min"
 
     def _get_monitor_value(self, metrics):
         """Extract the score tracked by early stopping and model selection."""
