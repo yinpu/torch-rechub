@@ -389,8 +389,7 @@ def test_mtl_trainer_supports_custom_losses_and_metrics():
             n_epoch=1,
             device="cpu",
             model_path=temp_dir,
-            compute_task_losses_func=loss_hook,
-            metric_names=["mae", "mae"],
+            compute_loss_func=loss_hook,
             compute_metrics=multitask_mae_metrics,
             metric_for_best_model="task_1_mae",
             greater_is_better=False,
@@ -408,10 +407,10 @@ def test_mtl_trainer_supports_custom_losses_and_metrics():
         assert trainer.early_stopper.mode == "min"
 
 
-def test_mtl_trainer_requires_metric_names_for_custom_evaluate_fns():
-    """Custom per-task evaluators should provide matching metric names."""
+def test_mtl_trainer_rejects_custom_monitor_without_custom_metrics():
+    """Default MTL evaluator should not pretend to expose custom metric keys."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        with pytest.raises(ValueError, match="require matching metric_names"):
+        with pytest.raises(ValueError, match="default evaluation only returns"):
             MTLTrainer(
                 model=MultiTaskBinaryModel(),
                 task_types=["classification", "classification"],
@@ -419,7 +418,7 @@ def test_mtl_trainer_requires_metric_names_for_custom_evaluate_fns():
                 n_epoch=1,
                 device="cpu",
                 model_path=temp_dir,
-                evaluate_fns=[binary_logloss, binary_logloss],
+                metric_for_best_model="task_0_logloss",
             )
 
 
@@ -435,15 +434,17 @@ def test_mtl_trainer_validates_custom_task_loss_count():
             n_epoch=1,
             device="cpu",
             model_path=temp_dir,
-            compute_task_losses_func=ShortTaskLosses(),
+            compute_loss_func=ShortTaskLosses(),
         )
 
         with pytest.raises(ValueError, match="must return 2 losses"):
             trainer.train_one_epoch(dataloader)
 
 
-def test_mtl_trainer_infers_default_monitor_from_custom_metric_names():
-    """Custom metric names should drive the default monitor key and direction."""
+def test_mtl_trainer_uses_default_task_monitor_without_custom_metrics():
+    """Built-in MTL evaluation should default to the monitored task metric key."""
+    dataloader = build_mtl_dataloader()
+
     with tempfile.TemporaryDirectory() as temp_dir:
         trainer = MTLTrainer(
             model=MultiTaskBinaryModel(),
@@ -452,12 +453,15 @@ def test_mtl_trainer_infers_default_monitor_from_custom_metric_names():
             n_epoch=1,
             device="cpu",
             model_path=temp_dir,
-            evaluate_fns=[binary_logloss, binary_logloss],
-            metric_names=["logloss", "logloss"],
         )
 
-        assert trainer.metric_for_best_model == "task_0_logloss"
-        assert trainer.early_stopper.mode == "min"
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+        scalar_score = trainer.evaluate(trainer.model, dataloader, return_dict=False)
+
+        assert trainer.metric_for_best_model == "task_0_auc"
+        assert trainer.early_stopper.mode == "max"
+        assert isinstance(scalar_score, float)
+        assert scalar_score == metrics["task_0_auc"]
 
 
 def test_mtl_trainer_scalar_custom_metric_defaults_to_min_monitor():
@@ -514,7 +518,6 @@ def test_mtl_trainer_preserves_task_ids_for_partial_metric_dicts():
             n_epoch=1,
             device="cpu",
             model_path=temp_dir,
-            metric_names=["mae", "mae"],
             compute_metrics=multitask_partial_metrics,
             metric_for_best_model="task_1_mae",
             greater_is_better=False,
@@ -527,4 +530,5 @@ def test_mtl_trainer_preserves_task_ids_for_partial_metric_dicts():
         assert np.isnan(total_log[0][2])
         assert isinstance(total_log[0][3], float)
         assert "val/task_0_score" not in metric_logs[-1]
-        assert "val/task_1_score" in metric_logs[-1]
+        assert "val/task_1_score" not in metric_logs[-1]
+        assert "val/task_1_mae" in metric_logs[-1]

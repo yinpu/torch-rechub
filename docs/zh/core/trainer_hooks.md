@@ -49,14 +49,12 @@ compute_loss_func(model, x_dict, y) -> torch.Tensor
 
 `MTLTrainer` 新增了：
 
-- `compute_task_losses_func`
-- `evaluate_fns`
-- `metric_names`
+- `compute_loss_func`
 
 核心接口：
 
 ```python
-compute_task_losses_func(model, x_dict, ys, y_preds) -> list[torch.Tensor]
+compute_loss_func(model, x_dict, ys, y_preds) -> list[torch.Tensor]
 ```
 
 返回值必须和任务数一致，即每个 task 返回一个标量 loss。Trainer 会继续负责：
@@ -196,7 +194,7 @@ def custom_task_losses(model, x_dict, ys, y_preds):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    compute_task_losses_func=custom_task_losses,
+    compute_loss_func=custom_task_losses,
 )
 ```
 
@@ -221,19 +219,11 @@ def multitask_metrics(targets, predicts):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    metric_names=["mae", "mae"],
     compute_metrics=multitask_metrics,
     metric_for_best_model="task_1_mae",
     greater_is_better=False,
 )
 ```
-
-如果你不想重写整个 `compute_metrics`，也可以只传：
-
-- `evaluate_fns`
-- `metric_names`
-
-这时 Trainer 仍按 task 逐个评估，只是替换每个 task 的评估函数。
 
 ## 监控规则与默认行为
 
@@ -250,7 +240,7 @@ trainer = MTLTrainer(
 `MTLTrainer`：
 
 - 仍然按每个 task 的默认评估函数工作
-- 默认监控 `task_{earlystop_taskid}_{metric_name}`
+- 默认监控 `task_{earlystop_taskid}_{default_metric}`
 - 分类任务默认指标名通常是 `auc`
 - 回归任务默认指标名通常是 `mse`
 
@@ -307,26 +297,11 @@ greater_is_better=False
 - CTR / Match: `val/logloss`、`val/auc`
 - MTL: `val/task_0_mae`、`val/task_1_mae`
 
-`MTLTrainer` 还会额外保留兼容性日志：
-
-- `val/task_0_score`
-- `val/task_1_score`
-
-这样旧的实验面板不会马上失效，但推荐后续直接使用具名指标键。
-
 ## 常见约束与报错含义
 
-### `compute_task_losses_func` 返回数量不对
+### `compute_loss_func` 返回数量不对
 
 如果你配置了 2 个 task，却只返回 1 个 loss，Trainer 会报错。原因很直接：Trainer 需要逐 task 的 loss，才能继续做聚合和多任务权重处理。
-
-### 自定义 `evaluate_fns` 但没传 `metric_names`
-
-这时 `MTLTrainer` 会报错。因为 Trainer 需要稳定的指标名，才能生成：
-
-- 日志 key
-- 默认 monitor key
-- early stopping 方向推断
 
 ### `metric_for_best_model` 在返回指标里不存在
 
@@ -334,15 +309,14 @@ greater_is_better=False
 
 - 指标名拼错了
 - `compute_metrics` 返回结构和预期不一致
-- MTL 场景下 task id 或 metric name 对不上
+- MTL 场景下 task id 对不上
 
 ## 推荐实践
 
-- 只想换训练 loss 时，优先改 `compute_loss_func` 或 `compute_task_losses_func`，不要重写整个 Trainer
+- 只想换训练 loss 时，优先改 `compute_loss_func`，不要重写整个 Trainer
 - 只想换验证指标时，优先改 `compute_metrics`
 - 返回多个指标时，始终显式设置 `metric_for_best_model`
 - 监控 `loss` / `mae` / `rmse` 一类指标时，显式写 `greater_is_better=False`
-- MTL 自定义 `evaluate_fns` 时，始终同时传 `metric_names`
 - 如果是实验性指标，先打印 `trainer.evaluate(..., return_dict=True)` 看实际 key，再配置 monitor
 
 ## 和 `main` 分支相比的行为变化

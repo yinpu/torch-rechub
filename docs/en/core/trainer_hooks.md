@@ -45,14 +45,12 @@ All three trainers now support:
 
 `MTLTrainer` now supports:
 
-- `compute_task_losses_func`
-- `evaluate_fns`
-- `metric_names`
+- `compute_loss_func`
 
 Main hook signature:
 
 ```python
-compute_task_losses_func(model, x_dict, ys, y_preds) -> list[torch.Tensor]
+compute_loss_func(model, x_dict, ys, y_preds) -> list[torch.Tensor]
 ```
 
 The returned loss list must match the number of tasks.
@@ -157,8 +155,7 @@ def multitask_metrics(targets, predicts):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    compute_task_losses_func=custom_task_losses,
-    metric_names=["mae", "mae"],
+    compute_loss_func=custom_task_losses,
     compute_metrics=multitask_metrics,
     metric_for_best_model="task_1_mae",
     greater_is_better=False,
@@ -171,7 +168,7 @@ trainer = MTLTrainer(
 
 `CTRTrainer` and `MatchTrainer` still expose only the built-in `auc`. If you want to monitor `logloss`, `mae`, or any other metric, you must provide `compute_metrics`.
 
-`MTLTrainer` still uses the per-task default evaluators and monitors `task_{earlystop_taskid}_{metric_name}` by default.
+`MTLTrainer` still uses the built-in per-task evaluators and monitors `task_{earlystop_taskid}_{default_metric}` by default.
 
 ### When `compute_metrics` returns a single float
 
@@ -206,8 +203,7 @@ This is only a heuristic. For business-specific metrics, set the direction expli
 
 ## Constraints and common mistakes
 
-- `compute_task_losses_func` must return one loss per configured task.
-- If you override `evaluate_fns` in `MTLTrainer`, also provide matching `metric_names`.
+- `compute_loss_func` must return one loss per configured task.
 - If `metric_for_best_model` does not exist in the returned metric dict, the trainer raises an error.
 - For experimental metrics, inspect `trainer.evaluate(..., return_dict=True)` first and then configure the monitor key.
 
@@ -218,4 +214,4 @@ Relative to `main`, this branch turns the trainers from mostly fixed training wr
 - custom loss injection without rewriting the loop
 - custom validation metrics and best-model selection
 - proper support for minimize-style monitors
-- better multi-task customization and naming
+- better multi-task customization

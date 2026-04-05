@@ -75,7 +75,7 @@ When `model_logger=None`, training runs without any tracking calls—no extra co
 | -------------- | --------- | ------------------------------------------------------------------------------ |
 | `CTRTrainer`   | ✅         | `train/loss`, `learning_rate`, `val/auc`                                       |
 | `MatchTrainer` | ✅         | `train/loss`, `learning_rate`, `val/auc`                                       |
-| `MTLTrainer`   | ✅         | `train/task_i_loss`, `learning_rate`, `val/task_i_score`, `loss_weight/task_i` |
+| `MTLTrainer`   | ✅         | `train/task_i_loss`, `learning_rate`, `val/task_i_auc` / `val/task_i_mse` / custom metric keys, `loss_weight/task_i` |
 | `SeqTrainer`   | ✅         | `train/loss`, `learning_rate`, `val/loss`, `val/accuracy`                      |
 
 ## Lifecycle Management

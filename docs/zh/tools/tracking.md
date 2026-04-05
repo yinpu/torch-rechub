@@ -75,7 +75,7 @@ os.environ['SWANLAB_API_KEY'] = "your API_KEY"
 | -------------- | ---- | ------------------------------------------------------------------------------ |
 | `CTRTrainer`   | ✅    | `train/loss`, `learning_rate`, `val/auc`                                       |
 | `MatchTrainer` | ✅    | `train/loss`, `learning_rate`, `val/auc`                                       |
-| `MTLTrainer`   | ✅    | `train/task_i_loss`, `learning_rate`, `val/task_i_score`, `loss_weight/task_i` |
+| `MTLTrainer`   | ✅    | `train/task_i_loss`, `learning_rate`, `val/task_i_auc` / `val/task_i_mse` / 自定义指标键, `loss_weight/task_i` |
 | `SeqTrainer`   | ✅    | `train/loss`, `learning_rate`, `val/loss`, `val/accuracy`                      |
 
 ## 生命周期管理

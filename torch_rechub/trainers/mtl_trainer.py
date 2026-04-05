@@ -30,13 +30,9 @@ class MTLTrainer(object):
         device (str): `"cpu"` or `"cuda:0"`
         gpus (list): id of multi gpu (default=[]). If the length >=1, then the model will wrapped by nn.DataParallel.
         model_path (str): the path you want to save the model (default="./"). Note only save the best weight in the validation data.
-        compute_task_losses_func (callable, optional): custom multi-task loss
-            hook with signature ``compute_task_losses_func(model, x_dict, ys,
-            y_preds)`` returning one scalar loss tensor per task.
-        evaluate_fns (list, optional): custom per-task metric functions used by
-            the default evaluation path.
-        metric_names (list[str], optional): names used in logs and metric keys
-            such as ``task_0_auc``.
+        compute_loss_func (callable, optional): custom multi-task loss hook
+            with signature ``compute_loss_func(model, x_dict, ys, y_preds)``
+            returning one scalar loss tensor per task.
         compute_metrics (callable, optional): custom metric hook with signature
             ``compute_metrics(targets, predicts)`` returning a float or a
             metric dict.
@@ -63,9 +59,7 @@ class MTLTrainer(object):
         gpus=None,
         model_path="./",
         model_logger=None,
-        compute_task_losses_func=None,
-        evaluate_fns=None,
-        metric_names=None,
+        compute_loss_func=None,
         compute_metrics=None,
         metric_for_best_model=None,
         greater_is_better=None,
@@ -111,22 +105,17 @@ class MTLTrainer(object):
         if scheduler_fn is not None:
             self.scheduler = scheduler_fn(self.optimizer, **scheduler_params)
         self.task_loss_fns = [get_loss_func(task_type) for task_type in task_types]
-        self.compute_task_losses_func = compute_task_losses_func or self._compute_default_task_losses
-        if evaluate_fns is None:
-            self.evaluate_fns = [get_metric_func(task_type) for task_type in task_types]
-        else:
-            if len(evaluate_fns) != self.n_task:
-                raise ValueError(f"evaluate_fns must have length {self.n_task}, got {len(evaluate_fns)}")
-            self.evaluate_fns = list(evaluate_fns)
+        self.task_metric_fns = [get_metric_func(task_type) for task_type in task_types]
+        self.default_metric_names = self._init_default_metric_names(task_types)
+        self.compute_loss_func = compute_loss_func or self._compute_default_task_losses
         self.compute_metrics = compute_metrics
-        self._validate_metric_configuration(metric_names, evaluate_fns)
-        self.metric_names = self._init_metric_names(task_types, metric_names)
         self.metric_for_best_model = metric_for_best_model
         self.greater_is_better = greater_is_better
         self._should_infer_monitor_direction = greater_is_better is None
+        self.earlystop_taskid = earlystop_taskid
+        self._validate_metric_configuration()
         self._initialize_metric_configuration(earlystop_taskid)
         self.n_epoch = n_epoch
-        self.earlystop_taskid = earlystop_taskid
         self.early_stopper = EarlyStopper(
             patience=earlystop_patience,
             mode="max" if self.greater_is_better else "min",
@@ -213,12 +202,12 @@ class MTLTrainer(object):
             monitor_value = self._get_monitor_value(metrics)
             print('epoch:', epoch_i, 'validation metrics:', metrics)
 
-            for task_id, score in self._task_metric_values(metrics):
+            for task_id, metric_key, score in self._task_metric_values(metrics):
                 if score is None:
                     _log_per_epoch.append(float("nan"))
                     continue
-                logs[f'val/task_{task_id}_score'] = score
-                logs[f'val/task_{task_id}_{self.metric_names[task_id]}'] = score
+                if metric_key is not None:
+                    logs[f'val/{metric_key}'] = score
                 _log_per_epoch.append(score)
 
             for name, value in metrics.items():
@@ -275,12 +264,8 @@ class MTLTrainer(object):
             return self.optimizer.param_groups[0]['lr']
         return None
 
-    def _init_metric_names(self, task_types, metric_names):
-        """Resolve metric names used in logs and early stopping."""
-        if metric_names is not None:
-            if len(metric_names) != self.n_task:
-                raise ValueError(f"metric_names must have length {self.n_task}, got {len(metric_names)}")
-            return list(metric_names)
+    def _init_default_metric_names(self, task_types):
+        """Resolve the built-in metric names used by the default evaluator."""
         default_names = []
         for task_type in task_types:
             if task_type == "classification":
@@ -291,18 +276,19 @@ class MTLTrainer(object):
                 default_names.append("score")
         return default_names
 
-    def _validate_metric_configuration(self, metric_names, evaluate_fns):
-        """Require explicit metric names when built-in task metrics are overridden."""
-        if evaluate_fns is not None and self.compute_metrics is None and metric_names is None:
+    def _validate_metric_configuration(self):
+        """Reject monitor names unsupported by the built-in evaluator."""
+        if self.compute_metrics is None and self.metric_for_best_model not in {None, *self._default_metric_keys()}:
             raise ValueError(
-                "Custom evaluate_fns require matching metric_names when compute_metrics is not provided."
+                "MTLTrainer default evaluation only returns the built-in per-task metrics: "
+                f"{self._default_metric_keys()}. Pass compute_metrics to monitor a different metric."
             )
 
     def _initialize_metric_configuration(self, default_task_id):
         """Resolve monitor defaults before training starts."""
         if self.compute_metrics is None:
             if self.metric_for_best_model is None:
-                self.metric_for_best_model = f"task_{default_task_id}_{self.metric_names[default_task_id]}"
+                self.metric_for_best_model = self._default_metric_key(default_task_id)
             if self.greater_is_better is None:
                 monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, default_task_id)
                 self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
@@ -341,10 +327,10 @@ class MTLTrainer(object):
 
     def _compute_task_losses(self, x_dict, ys, y_preds):
         """Compute one scalar loss tensor per task."""
-        loss_list = self.compute_task_losses_func(self.model, x_dict, ys, y_preds)
+        loss_list = self.compute_loss_func(self.model, x_dict, ys, y_preds)
         if len(loss_list) != self.n_task:
             raise ValueError(
-                f"compute_task_losses_func must return {self.n_task} losses, got {len(loss_list)}"
+                f"compute_loss_func must return {self.n_task} losses, got {len(loss_list)}"
             )
         return list(loss_list)
 
@@ -368,8 +354,8 @@ class MTLTrainer(object):
         """Compute the default per-task metrics."""
         metrics = {}
         for task_id in range(self.n_task):
-            metric_name = f"task_{task_id}_{self.metric_names[task_id]}"
-            metrics[metric_name] = float(self.evaluate_fns[task_id](targets[:, task_id], predicts[:, task_id]))
+            metric_name = self._default_metric_key(task_id)
+            metrics[metric_name] = float(self.task_metric_fns[task_id](targets[:, task_id], predicts[:, task_id]))
         return metrics
 
     def _normalize_metrics(self, metrics, default_name):
@@ -420,13 +406,57 @@ class MTLTrainer(object):
             )
         return metrics[self.metric_for_best_model]
 
+    def _default_metric_key(self, task_id):
+        """Return the built-in metric key for a task."""
+        return f"task_{task_id}_{self.default_metric_names[task_id]}"
+
+    def _default_metric_keys(self):
+        """Return the built-in metric keys exposed by default evaluation."""
+        return [self._default_metric_key(task_id) for task_id in range(self.n_task)]
+
+    def _select_task_metric_key(self, task_id, metrics):
+        """Pick the representative metric key for a task from ``metrics``."""
+        default_key = self._default_metric_key(task_id)
+        if default_key in metrics:
+            return default_key
+
+        prefix = f"task_{task_id}_"
+        candidate_keys = [name for name in metrics if name.startswith(prefix)]
+        if not candidate_keys:
+            return None
+        if self.metric_for_best_model in candidate_keys:
+            return self.metric_for_best_model
+        if len(candidate_keys) == 1:
+            return candidate_keys[0]
+        return sorted(candidate_keys)[0]
+
     def _task_metric_values(self, metrics):
         """Return per-task metric values in task order with task ids preserved."""
         values = []
-        for task_id, metric_name in enumerate(self.metric_names):
-            key = f"task_{task_id}_{metric_name}"
-            values.append((task_id, metrics.get(key)))
+        for task_id in range(self.n_task):
+            key = self._select_task_metric_key(task_id, metrics)
+            values.append((task_id, key, metrics.get(key) if key is not None else None))
         return values
+
+    def _evaluate_metrics(self, model, data_loader):
+        """Collect predictions on ``data_loader`` and compute metrics."""
+        model.eval()
+        targets, predicts = list(), list()
+        with torch.no_grad():
+            tk0 = tqdm.tqdm(data_loader, desc="validation", smoothing=0, mininterval=1.0)
+            for i, (x_dict, ys) in enumerate(tk0):
+                x_dict = {k: v.to(self.device) for k, v in x_dict.items()}  # tensor to GPU
+                ys = ys.to(self.device)
+                y_preds = model(x_dict)
+                targets.extend(ys.tolist())
+                predicts.extend(y_preds.tolist())
+        targets, predicts = np.array(targets), np.array(predicts)
+        if self.compute_metrics is not None:
+            return self._normalize_metrics(
+                self.compute_metrics(targets, predicts),
+                default_name=self.metric_for_best_model,
+            )
+        return self._default_metrics(targets, predicts)
 
     def evaluate(self, model, data_loader, return_dict=None):
         """Evaluate the model on a validation/test data loader.
@@ -435,39 +465,19 @@ class MTLTrainer(object):
             model (nn.Module): model to evaluate.
             data_loader (DataLoader): evaluation data loader.
             return_dict (bool, optional): when ``True``, return a metric dict.
-                When ``False``, return the historical list output used by the
-                built-in per-task evaluators, or the scalar selected by
-                ``metric_for_best_model`` when ``compute_metrics`` is set.
+                When ``False``, return the scalar selected by
+                ``metric_for_best_model``. Defaults to ``True`` only when a
+                custom ``compute_metrics`` hook is configured.
 
         Returns:
-            list[float] or float or dict[str, float]: evaluation result.
+            float or dict[str, float]: scalar monitor metric or a metric dict.
         """
         if return_dict is None:
             return_dict = self.compute_metrics is not None
-        model.eval()
-        targets, predicts = list(), list()
-        with torch.no_grad():
-            tk0 = tqdm.tqdm(data_loader, desc="validation", smoothing=0, mininterval=1.0)
-            for i, (x_dict, ys) in enumerate(tk0):
-                x_dict = {k: v.to(self.device) for k, v in x_dict.items()}  # tensor to GPU
-                ys = ys.to(self.device)
-                y_preds = self.model(x_dict)
-                targets.extend(ys.tolist())
-                predicts.extend(y_preds.tolist())
-        targets, predicts = np.array(targets), np.array(predicts)
-        if self.compute_metrics is not None:
-            metrics = self._normalize_metrics(
-                self.compute_metrics(targets, predicts),
-                default_name=self.metric_for_best_model,
-            )
-            if return_dict:
-                return metrics
-            return self._get_monitor_value(metrics)
-
-        metrics = self._default_metrics(targets, predicts)
+        metrics = self._evaluate_metrics(model, data_loader)
         if return_dict:
             return metrics
-        return [metrics[f"task_{task_id}_{self.metric_names[task_id]}"] for task_id in range(self.n_task)]
+        return self._get_monitor_value(metrics)
 
     def predict(self, model, data_loader):
         model.eval()

@@ -10,7 +10,7 @@ Torch-RecHub提供了多种训练器，用于训练不同类型的推荐模型�
 ## 实验跟踪与可视化
 
 - 支持 **WandB / SwanLab / TensorBoardX** 作为 `model_logger`，可传入单个实例或列表。
-- 自动记录训练/验证指标与超参数：`train/loss`、`learning_rate`、`val/auc`（CTR/Match）、`val/task_i_score`（MTL）、`val/accuracy`（Seq）。
+- 自动记录训练/验证指标与超参数：`train/loss`、`learning_rate`、`val/auc`（CTR/Match）、`val/task_i_auc` / `val/task_i_mse` / 自定义指标键（MTL）、`val/accuracy`（Seq）。
 - 不需要记录时传 `model_logger=None`（默认）即可零开销。
 
 ```python
@@ -174,9 +174,7 @@ trainer.export_onnx("mmoe.onnx")
 - `device`：训练设备
 - `gpus`：多GPU列表
 - `model_path`：模型保存路径
-- `compute_task_losses_func`：可选的多任务 loss hook，签名为 `compute_task_losses_func(model, x_dict, ys, y_preds)`
-- `evaluate_fns`：可选的逐任务评估函数列表，用于默认评估路径
-- `metric_names`：可选的指标名列表，用于生成 `val/task_0_auc` 这类日志键
+- `compute_loss_func`：可选的多任务 loss hook，签名为 `compute_loss_func(model, x_dict, ys, y_preds)`
 - `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(targets, predicts)`，可返回单个 float 或 `dict[str, float]`
 - `metric_for_best_model`：用于早停和最优模型选择的指标名
 - `greater_is_better`：`metric_for_best_model` 是否“越大越好”
@@ -253,8 +251,7 @@ def multitask_metrics(targets, predicts):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    compute_task_losses_func=task_losses,
-    metric_names=["mae", "mae"],
+    compute_loss_func=task_losses,
     compute_metrics=multitask_metrics,
     metric_for_best_model="task_1_mae",
     greater_is_better=False,
@@ -267,7 +264,7 @@ trainer = MTLTrainer(
 - 当返回多个指标时，`metric_for_best_model` 必须对应其中一个 key。
 - 对于 `loss`、`logloss`、`mse`、`mae`、`rmse` 这类越小越好的指标，需要设置 `greater_is_better=False`。
 - 当未提供 `compute_metrics` 时，`CTRTrainer` 和 `MatchTrainer` 的默认评估只会产出内置的 `auc`，因此不支持自定义 monitor 名称。
-- 当在 `MTLTrainer` 中自定义 `evaluate_fns` 时，也需要同时传入匹配的 `metric_names`，否则默认指标 key 和 early stopping 方向可能不一致。
+- 当未提供 `compute_metrics` 时，`MTLTrainer` 默认只产出内置的逐 task 指标，例如 `task_0_auc` 或 `task_1_mse`。
 
 ## 回调函数
 

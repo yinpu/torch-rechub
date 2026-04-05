@@ -10,7 +10,7 @@ Torch-RecHub provides trainers for ranking, matching, multi-task, and generative
 ## Experiment Tracking & Visualization
 
 - Supports **WandB / SwanLab / TensorBoardX** as `model_logger`; you can pass a single instance or a list.
-- Auto-logs train/validation metrics and hyperparameters: `train/loss`, `learning_rate`, `val/auc` (CTR/Match), `val/task_i_score` (MTL), `val/accuracy` (Seq).
+- Auto-logs train/validation metrics and hyperparameters: `train/loss`, `learning_rate`, `val/auc` (CTR/Match), `val/task_i_auc` / `val/task_i_mse` / custom metric keys (MTL), `val/accuracy` (Seq).
 - Set `model_logger=None` (default) for zero overhead when tracking is not needed.
 
 ```python
@@ -163,9 +163,7 @@ trainer.export_onnx("mmoe.onnx")
 - `device`: Training device.
 - `gpus`: List of GPU ids.
 - `model_path`: Path to save the model.
-- `compute_task_losses_func`: Optional multi-task loss hook with signature `compute_task_losses_func(model, x_dict, ys, y_preds)`.
-- `evaluate_fns`: Optional list of per-task metric functions used by the default evaluator.
-- `metric_names`: Optional list of metric names used in logs such as `val/task_0_auc`.
+- `compute_loss_func`: Optional multi-task loss hook with signature `compute_loss_func(model, x_dict, ys, y_preds)`.
 - `compute_metrics`: Optional callable `compute_metrics(targets, predicts)` returning a metric dict.
 - `metric_for_best_model`: Metric name used for early stopping and best-checkpoint selection.
 - `greater_is_better`: Whether a larger `metric_for_best_model` value indicates a better model.
@@ -242,8 +240,7 @@ def multitask_metrics(targets, predicts):
 trainer = MTLTrainer(
     model=model,
     task_types=["classification", "classification"],
-    compute_task_losses_func=task_losses,
-    metric_names=["mae", "mae"],
+    compute_loss_func=task_losses,
     compute_metrics=multitask_metrics,
     metric_for_best_model="task_1_mae",
     greater_is_better=False,
@@ -256,7 +253,7 @@ Notes:
 - `metric_for_best_model` must match one key from the metric dict when multiple metrics are returned.
 - Use `greater_is_better=False` for metrics such as `loss`, `logloss`, `mse`, `mae`, or `rmse`.
 - Without `compute_metrics`, `CTRTrainer` and `MatchTrainer` only expose the built-in `auc` metric, so custom monitor names are not supported on the default evaluator.
-- When overriding `evaluate_fns` in `MTLTrainer`, also pass matching `metric_names` so default metric keys and early-stopping direction stay aligned.
+- Without `compute_metrics`, `MTLTrainer` exposes the built-in per-task metrics only, such as `task_0_auc` or `task_1_mse`.
 
 ## Callbacks
 
