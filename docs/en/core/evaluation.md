@@ -250,6 +250,8 @@ Notes:
 - `compute_metrics` should return a single float or a metric dict.
 - `metric_for_best_model` must match one key from the metric dict when multiple metrics are returned.
 - Use `greater_is_better=False` for metrics such as `loss`, `logloss`, `mse`, `mae`, or `rmse`.
+- Without `compute_metrics`, `CTRTrainer` and `MatchTrainer` only expose the built-in `auc` metric, so custom monitor names are not supported on the default evaluator.
+- When overriding `evaluate_fns` in `MTLTrainer`, also pass matching `metric_names` so default metric keys and early-stopping direction stay aligned.
 
 ## Callbacks
 

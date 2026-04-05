@@ -83,6 +83,7 @@ class CTRTrainer(object):
         self.compute_metrics = compute_metrics
         self.metric_for_best_model = metric_for_best_model
         self.greater_is_better = greater_is_better
+        self._validate_metric_configuration()
         self.n_epoch = n_epoch
         self.early_stopper = EarlyStopper(
             patience=earlystop_patience,
@@ -223,13 +224,21 @@ class CTRTrainer(object):
         if self.compute_metrics is not None:
             raw_metrics = self.compute_metrics(targets, predicts)
             return self._normalize_metrics(raw_metrics, default_name=self.metric_for_best_model)
-        return self._normalize_metrics(self.evaluate_fn(targets, predicts), default_name=self.metric_for_best_model)
+        return self._normalize_metrics(self.evaluate_fn(targets, predicts), default_name="auc")
 
     def _normalize_metrics(self, metrics, default_name):
         """Normalize custom metric output to ``dict[str, float]``."""
         if isinstance(metrics, dict):
             return {str(name): float(value) for name, value in metrics.items()}
         return {default_name: float(metrics)}
+
+    def _validate_metric_configuration(self):
+        """Reject monitor names unsupported by the built-in evaluator."""
+        if self.compute_metrics is None and self.metric_for_best_model != "auc":
+            raise ValueError(
+                "CTRTrainer default evaluation only returns 'auc'. "
+                "Pass compute_metrics to monitor a different metric."
+            )
 
     def _get_monitor_value(self, metrics):
         """Extract the score tracked by early stopping and model selection."""

@@ -1,6 +1,7 @@
 import tempfile
 
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -84,15 +85,43 @@ class CountingPairwiseLoss(object):
         return -(pos_score - neg_score).sigmoid().log().mean()
 
 
-class CountingTaskLoss(object):
-    """Per-task loss wrapper for MTL custom loss tests."""
+class CountingTaskLosses(object):
+    """Batch-level loss hook for MTL custom loss tests."""
 
     def __init__(self):
         self.calls = 0
 
-    def __call__(self, y_pred, y_true):
+    def __call__(self, model, x_dict, ys, y_preds):
         self.calls += 1
-        return F.binary_cross_entropy(y_pred, y_true)
+        del model, x_dict
+        return [
+            F.binary_cross_entropy(y_preds[:, 0], ys[:, 0].float()),
+            F.binary_cross_entropy(y_preds[:, 1], ys[:, 1].float()),
+        ]
+
+
+class ShortTaskLosses(object):
+    """Invalid MTL loss hook used to verify return-shape validation."""
+
+    def __call__(self, model, x_dict, ys, y_preds):
+        del model, x_dict, ys
+        return [F.binary_cross_entropy(y_preds[:, 0], y_preds[:, 0].detach())]
+
+
+class RecordingLogger(object):
+    """Capture trainer metric payloads for assertions."""
+
+    def __init__(self):
+        self.history = []
+
+    def log_hyperparams(self, params):
+        self.history.append(("hyperparams", params))
+
+    def log_metrics(self, metrics, step=None):
+        self.history.append(("metrics", step, metrics))
+
+    def finish(self):
+        return None
 
 
 def build_ctr_dataloader():
@@ -137,6 +166,22 @@ def multitask_mae_metrics(targets, predicts):
         "task_0_mae": float(mae[0]),
         "task_1_mae": float(mae[1]),
     }
+
+
+def multitask_partial_metrics(targets, predicts):
+    """Return a metric dict for only one task."""
+    targets = np.asarray(targets)
+    predicts = np.asarray(predicts)
+    mae = np.abs(targets[:, 1] - predicts[:, 1]).mean()
+    return {"task_1_mae": float(mae)}
+
+
+def binary_logloss(y_true, y_pred):
+    """Return scalar logloss for custom evaluator tests."""
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    y_pred = np.clip(y_pred, 1e-6, 1 - 1e-6)
+    return float(-(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)).mean())
 
 
 def test_early_stopper_supports_min_mode():
@@ -197,6 +242,21 @@ def test_ctr_trainer_default_evaluate_remains_scalar():
         assert isinstance(score, float)
 
 
+def test_ctr_trainer_rejects_custom_monitor_without_custom_metrics():
+    """Default CTR evaluator should not relabel AUC as another metric."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with pytest.raises(ValueError, match="only returns 'auc'"):
+            CTRTrainer(
+                model=BinaryModel(),
+                optimizer_params={"lr": 0.05},
+                n_epoch=1,
+                device="cpu",
+                model_path=temp_dir,
+                metric_for_best_model="logloss",
+                greater_is_better=False,
+            )
+
+
 def test_match_trainer_supports_custom_pairwise_loss():
     """MatchTrainer should honor custom pair-wise loss hooks."""
     dataloader = build_pairwise_dataloader()
@@ -218,11 +278,25 @@ def test_match_trainer_supports_custom_pairwise_loss():
         assert loss_hook.calls > 0
 
 
+def test_match_trainer_rejects_custom_monitor_without_custom_metrics():
+    """Default matching evaluator should not relabel AUC as another metric."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with pytest.raises(ValueError, match="only returns 'auc'"):
+            MatchTrainer(
+                model=BinaryModel(),
+                optimizer_params={"lr": 0.05},
+                n_epoch=1,
+                device="cpu",
+                model_path=temp_dir,
+                metric_for_best_model="logloss",
+                greater_is_better=False,
+            )
+
+
 def test_mtl_trainer_supports_custom_losses_and_metrics():
     """MTLTrainer should accept custom per-task losses and metric dicts."""
     dataloader = build_mtl_dataloader()
-    loss_fn_0 = CountingTaskLoss()
-    loss_fn_1 = CountingTaskLoss()
+    loss_hook = CountingTaskLosses()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         trainer = MTLTrainer(
@@ -232,7 +306,7 @@ def test_mtl_trainer_supports_custom_losses_and_metrics():
             n_epoch=1,
             device="cpu",
             model_path=temp_dir,
-            loss_fns=[loss_fn_0, loss_fn_1],
+            compute_task_losses_func=loss_hook,
             metric_names=["mae", "mae"],
             compute_metrics=multitask_mae_metrics,
             metric_for_best_model="task_1_mae",
@@ -243,10 +317,90 @@ def test_mtl_trainer_supports_custom_losses_and_metrics():
         metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
         scalar_score = trainer.evaluate(trainer.model, dataloader, return_dict=False)
 
-        assert loss_fn_0.calls > 0
-        assert loss_fn_1.calls > 0
+        assert loss_hook.calls > 0
         assert "task_0_mae" in metrics
         assert "task_1_mae" in metrics
         assert isinstance(metrics["task_1_mae"], float)
         assert isinstance(scalar_score, float)
         assert trainer.early_stopper.mode == "min"
+
+
+def test_mtl_trainer_requires_metric_names_for_custom_evaluate_fns():
+    """Custom per-task evaluators should provide matching metric names."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with pytest.raises(ValueError, match="require matching metric_names"):
+            MTLTrainer(
+                model=MultiTaskBinaryModel(),
+                task_types=["classification", "classification"],
+                optimizer_params={"lr": 0.05},
+                n_epoch=1,
+                device="cpu",
+                model_path=temp_dir,
+                evaluate_fns=[binary_logloss, binary_logloss],
+            )
+
+
+def test_mtl_trainer_validates_custom_task_loss_count():
+    """Custom MTL loss hooks must return one loss per configured task."""
+    dataloader = build_mtl_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_task_losses_func=ShortTaskLosses(),
+        )
+
+        with pytest.raises(ValueError, match="must return 2 losses"):
+            trainer.train_one_epoch(dataloader)
+
+
+def test_mtl_trainer_infers_default_monitor_from_custom_metric_names():
+    """Custom metric names should drive the default monitor key and direction."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            evaluate_fns=[binary_logloss, binary_logloss],
+            metric_names=["logloss", "logloss"],
+        )
+
+        assert trainer.metric_for_best_model == "task_0_logloss"
+        assert trainer.early_stopper.mode == "min"
+
+
+def test_mtl_trainer_preserves_task_ids_for_partial_metric_dicts():
+    """Partial metric dicts should not be reindexed onto lower task ids."""
+    dataloader = build_mtl_dataloader()
+    logger = RecordingLogger()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            metric_names=["mae", "mae"],
+            compute_metrics=multitask_partial_metrics,
+            metric_for_best_model="task_1_mae",
+            greater_is_better=False,
+            model_logger=logger,
+        )
+
+        total_log = trainer.fit(dataloader, dataloader)
+        metric_logs = [payload for kind, _, payload in logger.history if kind == "metrics"]
+
+        assert np.isnan(total_log[0][2])
+        assert isinstance(total_log[0][3], float)
+        assert "val/task_0_score" not in metric_logs[-1]
+        assert "val/task_1_score" in metric_logs[-1]
