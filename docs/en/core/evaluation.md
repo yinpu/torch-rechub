@@ -112,7 +112,7 @@ trainer.export_onnx("item_tower.onnx", mode="item")
 - `device`: Training device.
 - `gpus`: List of GPU ids.
 - `model_path`: Path to save the model.
-- `compute_loss_func`: Optional callable `compute_loss_func(model, x_dict, y)` to override the built-in point-wise / pair-wise / list-wise loss.
+- `compute_loss_func`: Optional callable `compute_loss_func(model, x_dict, y)` that fully overrides the built-in training-loss path. For `MatchTrainer`, this means built-in point-wise / pair-wise / list-wise construction, including `in_batch_neg`, is bypassed once the hook is set. The hook must rebuild any required sampling or auxiliary-loss logic itself.
 - `compute_metrics`: Optional callable `compute_metrics(y_true, y_pred)` returning a float or `dict[str, float]`.
 - `metric_for_best_model`: Metric name used for early stopping and best-checkpoint selection.
 - `greater_is_better`: Whether a larger `metric_for_best_model` value indicates a better model.

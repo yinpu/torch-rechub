@@ -28,9 +28,16 @@ description: Torch-RecHub 训练器自定义损失、指标与监控策略
 compute_loss_func(model, x_dict, y) -> torch.Tensor
 ```
 
+对单任务 Trainer 来说，这个 hook 是完整覆盖型接口。一旦设置，
+Trainer 在调用 hook 前就不再先执行内置任务 loss 构造逻辑。
+
 对 `CTRTrainer` 而言，这个 hook 目前只保证在 `loss_mode=True` 时可直接使用。
 如果 `loss_mode=False`，模型会返回 `(y_pred, auxiliary_loss)`，自定义 hook
 需要自行处理 tuple 解包，并把辅助损失加回最终 loss。
+
+对 `MatchTrainer` 而言，这还意味着内置的 point-wise / pair-wise / list-wise
+loss 构造以及 `in_batch_neg` 采样也都会被绕过；如果你的训练仍依赖这些语义，
+需要在 hook 中基于 `model` 和 `x_dict` 自行重建。
 
 你可以直接复用 Trainer 的训练循环、优化器、正则化、scheduler 和 logger，只替换任务损失本身。
 
@@ -144,6 +151,8 @@ trainer = CTRTrainer(
 
 ### MatchTrainer
 
+这里的 `compute_loss_func` 是完整覆盖语义，不是“包一层默认召回损失”，而是直接替换它。
+
 新增参数和 `CTRTrainer` 一致，但更适合以下场景：
 
 - 替换 point-wise / pair-wise / list-wise 默认 loss
@@ -168,6 +177,10 @@ trainer = MatchTrainer(
     compute_loss_func=pairwise_logsigmoid_loss,
 )
 ```
+
+如果你把 `compute_loss_func` 和 `in_batch_neg=True` 一起使用，那么 hook 需要自行调用
+`user_tower`、`item_tower`、`inbatch_negative_sampling(...)`、
+`gather_inbatch_logits(...)` 等逻辑，Trainer 不会再代你完成这一步。
 
 注意：
 
@@ -232,6 +245,12 @@ trainer = MTLTrainer(
 ## 监控规则与默认行为
 
 这是这次功能最容易踩坑的部分。
+
+在自定义 loss 方面，也有一个必须明确的约定：
+
+- 对 `MatchTrainer`，`compute_loss_func` 是完整覆盖接口
+- Trainer 不会在 hook 之前先套用内置 `mode` 语义或 `in_batch_neg`
+- 因此 hook 必须自己决定是否以及如何重建这些训练目标
 
 ### 1. 不传 `compute_metrics` 时
 

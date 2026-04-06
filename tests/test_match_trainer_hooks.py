@@ -97,6 +97,27 @@ def test_match_trainer_unwraps_dataparallel_for_custom_loss(monkeypatch):
         assert loss_hook.model_type is TwoTowerMatchModel
 
 
+def test_match_trainer_warns_when_custom_loss_overrides_inbatch_neg():
+    """Custom match losses should make the in-batch-negative override explicit."""
+    loss_hook = TowerAccessLoss()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with pytest.warns(UserWarning, match="fully overrides built-in loss semantics"):
+            trainer = MatchTrainer(
+                model=TwoTowerMatchModel(),
+                mode=0,
+                in_batch_neg=True,
+                in_batch_neg_ratio=1,
+                optimizer_params={"lr": 0.05},
+                n_epoch=1,
+                device="cpu",
+                model_path=temp_dir,
+                compute_loss_func=loss_hook,
+            )
+
+    assert trainer.compute_loss_func is loss_hook
+
+
 def test_match_trainer_rejects_custom_monitor_without_custom_metrics():
     """Default matching evaluator should not relabel AUC as another metric."""
     with tempfile.TemporaryDirectory() as temp_dir:

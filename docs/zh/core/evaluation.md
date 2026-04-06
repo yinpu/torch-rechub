@@ -123,7 +123,7 @@ trainer.export_onnx("item_tower.onnx", mode="item")
 - `device`：训练设备
 - `gpus`：多GPU列表
 - `model_path`：模型保存路径
-- `compute_loss_func`：可选的自定义损失函数，签名为 `compute_loss_func(model, x_dict, y)`，可覆盖内置 point-wise / pair-wise / list-wise 损失
+- `compute_loss_func`：可选的自定义损失函数，签名为 `compute_loss_func(model, x_dict, y)`，它会完整覆盖 Trainer 的内置训练损失路径。对 `MatchTrainer` 而言，一旦设置该 hook，内置的 point-wise / pair-wise / list-wise 构造逻辑以及 `in_batch_neg` 都会被绕过；若仍需要这些语义，需要在 hook 中自行实现。
 - `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(y_true, y_pred)`，可返回单个 float 或 `dict[str, float]`
 - `metric_for_best_model`：用于早停和最优模型选择的指标名
 - `greater_is_better`：`metric_for_best_model` 是否“越大越好”

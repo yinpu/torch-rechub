@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import torch
 import tqdm
@@ -30,7 +31,12 @@ class MatchTrainer(object):
         hard_negative (bool): whether to choose hardest negatives within batch (top-k by score) instead of uniform random.
         sampler_seed (int): optional random seed for in-batch sampler to ease reproducibility/testing.
         compute_loss_func (callable, optional): custom loss hook with signature
-            ``compute_loss_func(model, x_dict, y)``.
+            ``compute_loss_func(model, x_dict, y)``. This hook is a full loss
+            override: once set, the trainer no longer applies built-in
+            point-wise / pair-wise / list-wise loss construction. When used
+            with ``in_batch_neg=True``, the hook only receives ``(model,
+            x_dict, y)`` and must rebuild any in-batch negative sampling logic
+            itself.
         compute_metrics (callable, optional): custom metric hook with signature
             ``compute_metrics(y_true, y_pred)`` returning a float or a metric dict.
         metric_for_best_model (str): metric key monitored by early stopping and
@@ -89,6 +95,15 @@ class MatchTrainer(object):
                     "Only two-tower models with user_tower() and item_tower() methods are supported, "
                     "such as DSSM, YoutubeDNN, MIND, GRU4Rec, SINE, ComiRec, SASRec, NARM, STAMP, etc."
                 )
+        if compute_loss_func is not None and in_batch_neg:
+            warnings.warn(
+                "MatchTrainer compute_loss_func fully overrides built-in loss semantics, "
+                "including in_batch_neg sampling. The hook receives only "
+                "(model, x_dict, y) and must rebuild any in-batch negative "
+                "sampling logic itself.",
+                UserWarning,
+                stacklevel=2,
+            )
         if optimizer_params is None:
             optimizer_params = {"lr": 1e-3, "weight_decay": 1e-5}
         if regularization_params is None:

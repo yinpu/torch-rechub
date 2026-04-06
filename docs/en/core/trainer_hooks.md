@@ -28,10 +28,19 @@ Hook signature:
 compute_loss_func(model, x_dict, y) -> torch.Tensor
 ```
 
+This hook is a full loss override for single-task trainers. Once it is set, the
+trainer no longer applies its built-in task-loss construction before calling
+the hook.
+
 For `CTRTrainer`, this hook is only guaranteed to be safe when
 `loss_mode=True`. If `loss_mode=False`, the model returns
 `(y_pred, auxiliary_loss)`, so custom hooks must unpack the tuple and add the
 auxiliary term themselves.
+
+For `MatchTrainer`, this also means built-in point-wise / pair-wise / list-wise
+loss construction and `in_batch_neg` sampling are bypassed. If your experiment
+still depends on those semantics, rebuild them inside the hook from
+`model` and `x_dict`.
 
 ### Custom metric hooks for all main trainers
 
@@ -113,6 +122,9 @@ trainer = CTRTrainer(
 
 ### MatchTrainer
 
+`compute_loss_func` is a full override here. It does not wrap the built-in
+matching objective; it replaces it.
+
 ```python
 from torch_rechub.trainers import MatchTrainer
 
@@ -129,6 +141,11 @@ trainer = MatchTrainer(
     compute_loss_func=pairwise_logsigmoid_loss,
 )
 ```
+
+If you combine `compute_loss_func` with `in_batch_neg=True`, the hook is
+responsible for calling `user_tower`, `item_tower`,
+`inbatch_negative_sampling(...)`, and `gather_inbatch_logits(...)` itself if
+you still want in-batch negative semantics.
 
 ### MTLTrainer
 
@@ -210,7 +227,10 @@ This is only a heuristic. For business-specific metrics, set the direction expli
 
 ## Constraints and common mistakes
 
-- `compute_loss_func` must return one loss per configured task.
+- For `MatchTrainer`, `compute_loss_func` is a full override. Built-in
+  `mode`-specific loss construction and `in_batch_neg` sampling are not applied
+  before the hook runs.
+- For `MTLTrainer`, `compute_loss_func` must return one loss per configured task.
 - If `metric_for_best_model` does not exist in the returned metric dict, the trainer raises an error.
 - For experimental metrics, inspect `trainer.evaluate(..., return_dict=True)` first and then configure the monitor key.
 
