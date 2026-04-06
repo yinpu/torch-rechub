@@ -73,7 +73,7 @@ trainer.visualization(save_path="deepfm_architecture.pdf")
 - `gpus`：多GPU列表
 - `loss_mode`：损失模式，布尔值。True表示模型只返回预测值，False表示模型返回预测值和额外损失
 - `model_path`：模型保存路径
-- `compute_loss_func`：可选的自定义损失函数，签名为 `compute_loss_func(model, x_dict, y)`
+- `compute_loss_func`：可选的自定义损失函数，签名为 `compute_loss_func(model, x_dict, y)`。在 `CTRTrainer` 中，这一接口目前只在 `loss_mode=True` 时可直接使用；若 `loss_mode=False`，自定义 hook 需要自行处理 `(y_pred, auxiliary_loss)`。
 - `compute_metrics`：可选的自定义评估函数，签名为 `compute_metrics(y_true, y_pred)`，可返回单个 float 或 `dict[str, float]`
 - `metric_for_best_model`：用于早停和最优模型选择的指标名
 - `greater_is_better`：`metric_for_best_model` 是否“越大越好”

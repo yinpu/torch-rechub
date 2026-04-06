@@ -28,6 +28,11 @@ Hook signature:
 compute_loss_func(model, x_dict, y) -> torch.Tensor
 ```
 
+For `CTRTrainer`, this hook is only guaranteed to be safe when
+`loss_mode=True`. If `loss_mode=False`, the model returns
+`(y_pred, auxiliary_loss)`, so custom hooks must unpack the tuple and add the
+auxiliary term themselves.
+
 ### Custom metric hooks for all main trainers
 
 All three trainers now support:

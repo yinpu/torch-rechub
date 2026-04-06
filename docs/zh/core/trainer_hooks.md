@@ -28,6 +28,10 @@ description: Torch-RecHub 训练器自定义损失、指标与监控策略
 compute_loss_func(model, x_dict, y) -> torch.Tensor
 ```
 
+对 `CTRTrainer` 而言，这个 hook 目前只保证在 `loss_mode=True` 时可直接使用。
+如果 `loss_mode=False`，模型会返回 `(y_pred, auxiliary_loss)`，自定义 hook
+需要自行处理 tuple 解包，并把辅助损失加回最终 loss。
+
 你可以直接复用 Trainer 的训练循环、优化器、正则化、scheduler 和 logger，只替换任务损失本身。
 
 ### 2. 所有主训练器支持自定义 metric hook

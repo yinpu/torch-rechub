@@ -30,7 +30,11 @@ class CTRTrainer(object):
         dense_l1 (float): L1 regularization coefficient for dense parameters (default=0.0).
         dense_l2 (float): L2 regularization coefficient for dense parameters (default=0.0).
         compute_loss_func (callable, optional): custom loss hook with signature
-            ``compute_loss_func(model, x_dict, y)``.
+            ``compute_loss_func(model, x_dict, y)``. For ``CTRTrainer``, this
+            hook is only guaranteed to work when ``loss_mode=True``. When
+            ``loss_mode=False``, the model returns ``(y_pred, other_loss)``,
+            and custom hooks must handle tuple unpacking and auxiliary-loss
+            accumulation themselves.
         compute_metrics (callable, optional): custom metric hook with signature
             ``compute_metrics(y_true, y_pred)`` returning a float or a metric dict.
         metric_for_best_model (str): metric key monitored by early stopping and
