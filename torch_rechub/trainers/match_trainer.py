@@ -274,7 +274,8 @@ class MatchTrainer(object):
         """Compute task loss before regularization."""
         y = self._prepare_target(y)
         if self.compute_loss_func is not None:
-            return self.compute_loss_func(self.model, x_dict, y)
+            base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+            return self.compute_loss_func(base_model, x_dict, y)
         return self._compute_default_loss(x_dict, y)
 
     def _evaluate_metrics(self, model, data_loader):
@@ -329,14 +330,11 @@ class MatchTrainer(object):
             if scalar_output:
                 self.metric_for_best_model = "metric"
             else:
-                if len(metrics) != 1:
-                    raise ValueError(
-                        "Custom compute_metrics returned multiple metrics. "
-                        "Set metric_for_best_model to one of: "
-                        f"{sorted(metrics.keys())}"
-                    )
-                self.metric_for_best_model = next(iter(metrics))
-        if self._should_infer_monitor_direction:
+                if len(metrics) == 1:
+                    self.metric_for_best_model = next(iter(metrics))
+                else:
+                    return
+        if self._should_infer_monitor_direction and self.metric_for_best_model is not None:
             if scalar_output and self.metric_for_best_model == "metric":
                 self.greater_is_better = False
             else:
@@ -366,6 +364,12 @@ class MatchTrainer(object):
 
     def _get_monitor_value(self, metrics):
         """Extract the score tracked by early stopping and model selection."""
+        if self.metric_for_best_model is None:
+            raise ValueError(
+                "Custom compute_metrics returned multiple metrics. "
+                "Set metric_for_best_model to one of: "
+                f"{sorted(metrics.keys())}"
+            )
         if self.metric_for_best_model not in metrics:
             raise ValueError(
                 f"metric_for_best_model={self.metric_for_best_model!r} was not found in evaluation metrics: {sorted(metrics.keys())}"

@@ -52,6 +52,24 @@ class PairwiseModel(nn.Module):
         return pos_score, neg_score
 
 
+class TwoTowerMatchModel(nn.Module):
+    """Minimal two-tower model used for DataParallel loss-hook tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.user_linear = nn.Linear(1, 1)
+        self.item_linear = nn.Linear(1, 1)
+
+    def user_tower(self, x_dict):
+        return self.user_linear(x_dict["user"])
+
+    def item_tower(self, x_dict):
+        return self.item_linear(x_dict["item"])
+
+    def forward(self, x_dict):
+        return torch.sigmoid(self.user_tower(x_dict) + self.item_tower(x_dict))
+
+
 class MultiTaskBinaryModel(nn.Module):
     """Small two-task model used by MTL custom hook tests."""
 
@@ -87,6 +105,22 @@ class CountingPairwiseLoss(object):
         self.calls += 1
         pos_score, neg_score = model(x_dict)
         return -(pos_score - neg_score).sigmoid().log().mean()
+
+
+class TowerAccessLoss(object):
+    """Custom match loss that requires the underlying two-tower model."""
+
+    def __init__(self):
+        self.calls = 0
+        self.model_type = None
+
+    def __call__(self, model, x_dict, y):
+        del y
+        self.calls += 1
+        self.model_type = type(model)
+        user_embedding = model.user_tower(x_dict)
+        item_embedding = model.item_tower(x_dict)
+        return (user_embedding * item_embedding).mean()
 
 
 class CountingTaskLosses(object):
@@ -186,6 +220,16 @@ def binary_logloss_metrics(y_true, y_pred):
     y_pred = np.clip(y_pred, 1e-6, 1 - 1e-6)
     logloss = -(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)).mean()
     return {"logloss": float(logloss)}
+
+
+def binary_multi_metrics(y_true, y_pred):
+    """Return multiple binary metrics so callers can inspect monitor keys."""
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    y_pred = np.clip(y_pred, 1e-6, 1 - 1e-6)
+    logloss = -(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)).mean()
+    mae = np.abs(y_true - y_pred).mean()
+    return {"logloss": float(logloss), "mae": float(mae)}
 
 
 def multitask_mae_metrics(targets, predicts):
@@ -315,6 +359,28 @@ def test_ctr_trainer_scalar_custom_metric_defaults_to_min_monitor():
         assert trainer.early_stopper.mode == "min"
 
 
+def test_ctr_trainer_allows_multi_metric_inspection_before_monitor_selection():
+    """CTR multi-metric hooks should be inspectable before choosing a monitor."""
+    dataloader = build_ctr_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = CTRTrainer(
+            model=BinaryModel(),
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=binary_multi_metrics,
+        )
+
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+
+        assert set(metrics) == {"logloss", "mae"}
+        assert trainer.metric_for_best_model is None
+        with pytest.raises(ValueError, match="Set metric_for_best_model to one of"):
+            trainer.evaluate(trainer.model, dataloader, return_dict=False)
+
+
 def test_ctr_trainer_rejects_custom_monitor_without_custom_metrics():
     """Default CTR evaluator should not relabel AUC as another metric."""
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -373,6 +439,40 @@ def test_match_trainer_prepares_targets_for_custom_pointwise_loss():
         assert loss_hook.last_dtype == torch.float32
 
 
+def test_match_trainer_unwraps_dataparallel_for_custom_loss(monkeypatch):
+    """Custom match losses should receive the base model under DataParallel."""
+
+    class FakeDataParallel(object):
+        def __init__(self, module):
+            self.module = module
+
+    x_dict = {
+        "user": torch.ones(4, 1),
+        "item": torch.ones(4, 1),
+    }
+    loss_hook = TowerAccessLoss()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MatchTrainer(
+            model=TwoTowerMatchModel(),
+            mode=0,
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_loss_func=loss_hook,
+        )
+
+        monkeypatch.setattr(torch.nn, "DataParallel", FakeDataParallel)
+        trainer.model = torch.nn.DataParallel(trainer.model)
+
+        loss = trainer._compute_batch_loss(x_dict, torch.ones(4))
+
+        assert isinstance(loss, torch.Tensor)
+        assert loss_hook.calls == 1
+        assert loss_hook.model_type is TwoTowerMatchModel
+
+
 def test_match_trainer_rejects_custom_monitor_without_custom_metrics():
     """Default matching evaluator should not relabel AUC as another metric."""
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -409,6 +509,29 @@ def test_match_trainer_scalar_custom_metric_defaults_to_min_monitor():
         assert trainer.metric_for_best_model == "metric"
         assert trainer.greater_is_better is False
         assert trainer.early_stopper.mode == "min"
+
+
+def test_match_trainer_allows_multi_metric_inspection_before_monitor_selection():
+    """Match multi-metric hooks should be inspectable before choosing a monitor."""
+    dataloader = build_ctr_dataloader()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MatchTrainer(
+            model=BinaryModel(),
+            mode=0,
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_metrics=binary_multi_metrics,
+        )
+
+        metrics = trainer.evaluate(trainer.model, dataloader, return_dict=True)
+
+        assert set(metrics) == {"logloss", "mae"}
+        assert trainer.metric_for_best_model is None
+        with pytest.raises(ValueError, match="Set metric_for_best_model to one of"):
+            trainer.evaluate(trainer.model, dataloader, return_dict=False)
 
 
 def test_mtl_trainer_supports_custom_losses_and_metrics():
