@@ -123,6 +123,20 @@ class TowerAccessLoss(object):
         return (user_embedding * item_embedding).mean()
 
 
+class LinearAccessBinaryLoss(object):
+    """Custom CTR loss that requires the underlying binary model."""
+
+    def __init__(self):
+        self.calls = 0
+        self.model_type = None
+
+    def __call__(self, model, x_dict, y):
+        self.calls += 1
+        self.model_type = type(model)
+        logits = model.linear(x_dict["x"])
+        return F.binary_cross_entropy(torch.sigmoid(logits), y)
+
+
 class CountingTaskLosses(object):
     """Batch-level loss hook for MTL custom loss tests."""
 
@@ -135,6 +149,24 @@ class CountingTaskLosses(object):
         return [
             F.binary_cross_entropy(y_preds[:, 0], ys[:, 0].float()),
             F.binary_cross_entropy(y_preds[:, 1], ys[:, 1].float()),
+        ]
+
+
+class HeadAccessTaskLosses(object):
+    """Custom MTL loss that requires access to the underlying task heads."""
+
+    def __init__(self):
+        self.calls = 0
+        self.model_type = None
+
+    def __call__(self, model, x_dict, ys, y_preds):
+        del x_dict
+        self.calls += 1
+        self.model_type = type(model)
+        logits = model.linear.weight.sum()
+        return [
+            F.binary_cross_entropy(y_preds[:, 0], ys[:, 0].float()) + 0.0 * logits,
+            F.binary_cross_entropy(y_preds[:, 1], ys[:, 1].float()) + 0.0 * logits,
         ]
 
 
@@ -396,6 +428,37 @@ def test_ctr_trainer_rejects_custom_monitor_without_custom_metrics():
             )
 
 
+def test_ctr_trainer_unwraps_dataparallel_for_custom_loss(monkeypatch):
+    """Custom CTR losses should receive the base model under DataParallel."""
+
+    class FakeDataParallel(object):
+        def __init__(self, module):
+            self.module = module
+
+    x_dict = {"x": torch.ones(4, 1)}
+    y = torch.ones(4, 1)
+    loss_hook = LinearAccessBinaryLoss()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = CTRTrainer(
+            model=BinaryModel(),
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_loss_func=loss_hook,
+        )
+
+        monkeypatch.setattr(torch.nn, "DataParallel", FakeDataParallel)
+        trainer.model = torch.nn.DataParallel(trainer.model)
+
+        loss = trainer._compute_batch_loss(x_dict, y)
+
+        assert isinstance(loss, torch.Tensor)
+        assert loss_hook.calls == 1
+        assert loss_hook.model_type is BinaryModel
+
+
 def test_match_trainer_supports_custom_pairwise_loss():
     """MatchTrainer should honor custom pair-wise loss hooks."""
     dataloader = build_pairwise_dataloader()
@@ -599,6 +662,40 @@ def test_mtl_trainer_validates_custom_task_loss_count():
 
         with pytest.raises(ValueError, match="must return 2 losses"):
             trainer.train_one_epoch(dataloader)
+
+
+def test_mtl_trainer_unwraps_dataparallel_for_custom_loss(monkeypatch):
+    """Custom MTL losses should receive the base model under DataParallel."""
+
+    class FakeDataParallel(object):
+        def __init__(self, module):
+            self.module = module
+
+    x_dict = {"x": torch.ones(4, 1)}
+    ys = torch.ones(4, 2)
+    y_preds = torch.full((4, 2), 0.5)
+    loss_hook = HeadAccessTaskLosses()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=MultiTaskBinaryModel(),
+            task_types=["classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_loss_func=loss_hook,
+        )
+
+        monkeypatch.setattr(torch.nn, "DataParallel", FakeDataParallel)
+        trainer.model = torch.nn.DataParallel(trainer.model)
+
+        losses = trainer._compute_task_losses(x_dict, ys, y_preds)
+
+        assert len(losses) == 2
+        assert all(isinstance(loss, torch.Tensor) for loss in losses)
+        assert loss_hook.calls == 1
+        assert loss_hook.model_type is MultiTaskBinaryModel
 
 
 def test_mtl_trainer_esmm_default_aggregation_keeps_legacy_objective():

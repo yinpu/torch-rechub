@@ -317,9 +317,15 @@ class MTLTrainer(object):
         del model, x_dict
         return [self.task_loss_fns[i](y_preds[:, i], ys[:, i].float()) for i in range(self.n_task)]
 
+    def _get_base_model(self):
+        """Return the underlying model when wrapped for multi-GPU training."""
+        if isinstance(self.model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+            return self.model.module
+        return self.model
+
     def _compute_task_losses(self, x_dict, ys, y_preds):
         """Compute one scalar loss tensor per task."""
-        loss_list = self.compute_loss_func(self.model, x_dict, ys, y_preds)
+        loss_list = self.compute_loss_func(self._get_base_model(), x_dict, ys, y_preds)
         if len(loss_list) != self.n_task:
             raise ValueError(
                 f"compute_loss_func must return {self.n_task} losses, got {len(loss_list)}"
@@ -328,7 +334,7 @@ class MTLTrainer(object):
 
     def _aggregate_loss(self, loss_list):
         """Aggregate task losses according to the configured MTL strategy."""
-        base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        base_model = self._get_base_model()
         if isinstance(base_model, ESMM) and not self._has_custom_loss_hook:
             # ESMM only computes loss for ctr and ctcvr tasks.
             return sum(loss_list[1:])

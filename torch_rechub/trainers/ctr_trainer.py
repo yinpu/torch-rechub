@@ -193,10 +193,16 @@ class CTRTrainer(object):
             return metrics
         return self._get_monitor_value(metrics)
 
+    def _get_base_model(self):
+        """Return the underlying model when wrapped for multi-GPU training."""
+        if isinstance(self.model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+            return self.model.module
+        return self.model
+
     def _compute_batch_loss(self, x_dict, y):
         """Compute task loss before regularization."""
         if self.compute_loss_func is not None:
-            return self.compute_loss_func(self.model, x_dict, y)
+            return self.compute_loss_func(self._get_base_model(), x_dict, y)
         if self.loss_mode:
             y_pred = self.model(x_dict)
             return self.criterion(y_pred, y)
