@@ -1,5 +1,4 @@
 import os
-import re
 
 import numpy as np
 import torch
@@ -8,6 +7,7 @@ import tqdm
 
 from ..basic.callback import EarlyStopper
 from ..basic.loss_func import RegularizationLoss
+from ..basic.monitor import MetricMonitor
 from ..models.multi_task import ESMM
 from ..utils.data import get_loss_func, get_metric_func
 from ..utils.mtl import MetaBalance, gradnorm, shared_task_layers
@@ -110,17 +110,26 @@ class MTLTrainer(object):
         self._has_custom_loss_hook = compute_loss_func is not None
         self.compute_loss_func = compute_loss_func or self._compute_default_task_losses
         self.compute_metrics = compute_metrics
-        self.metric_for_best_model = metric_for_best_model
-        self.greater_is_better = greater_is_better
-        self._should_infer_monitor_direction = greater_is_better is None
         self.earlystop_taskid = earlystop_taskid
-        self._validate_metric_configuration()
-        self._initialize_metric_configuration(earlystop_taskid)
+        self._metric_monitor = MetricMonitor(
+            compute_metrics=compute_metrics,
+            metric_for_best_model=metric_for_best_model,
+            greater_is_better=greater_is_better,
+        )
+        self._metric_monitor.validate_builtin_metrics(
+            valid_metrics=self._default_metric_keys(),
+            error_message=(
+                "MTLTrainer default evaluation only returns the built-in per-task metrics: "
+                f"{self._default_metric_keys()}. Pass compute_metrics to monitor a different metric."
+            ),
+        )
+        self._metric_monitor.initialize(default_metric=self._default_metric_key(earlystop_taskid))
         self.n_epoch = n_epoch
         self.early_stopper = EarlyStopper(
             patience=earlystop_patience,
             mode="max" if self.greater_is_better else "min",
         )
+        self._metric_monitor.attach_early_stopper(self.early_stopper)
 
         self.gpus = gpus
         if len(gpus) > 1:
@@ -133,6 +142,14 @@ class MTLTrainer(object):
         # Initialize regularization loss
         self.reg_loss_fn = RegularizationLoss(**regularization_params)
         self.model_logger = model_logger
+
+    @property
+    def metric_for_best_model(self):
+        return self._metric_monitor.metric_for_best_model
+
+    @property
+    def greater_is_better(self):
+        return self._metric_monitor.greater_is_better
 
     def train_one_epoch(self, data_loader):
         self.model.train()
@@ -200,7 +217,7 @@ class MTLTrainer(object):
                 self.scheduler.step()  # update lr in epoch level by scheduler
 
             metrics = self.evaluate(self.model, val_dataloader, return_dict=True)
-            monitor_value = self._get_monitor_value(metrics)
+            monitor_value = self._metric_monitor.get_monitor_value(metrics)
             print('epoch:', epoch_i, 'validation metrics:', metrics)
 
             for name, value in metrics.items():
@@ -269,49 +286,6 @@ class MTLTrainer(object):
                 default_names.append("score")
         return default_names
 
-    def _validate_metric_configuration(self):
-        """Reject monitor names unsupported by the built-in evaluator."""
-        if self.compute_metrics is None and self.metric_for_best_model not in {None, *self._default_metric_keys()}:
-            raise ValueError(
-                "MTLTrainer default evaluation only returns the built-in per-task metrics: "
-                f"{self._default_metric_keys()}. Pass compute_metrics to monitor a different metric."
-            )
-
-    def _initialize_metric_configuration(self, default_task_id):
-        """Resolve monitor defaults before training starts."""
-        if self.compute_metrics is None:
-            if self.metric_for_best_model is None:
-                self.metric_for_best_model = self._default_metric_key(default_task_id)
-            if self.greater_is_better is None:
-                monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, default_task_id)
-                self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
-            self._should_infer_monitor_direction = False
-            return
-        if self.greater_is_better is None and self.metric_for_best_model is not None:
-            monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, default_task_id)
-            self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
-            self._should_infer_monitor_direction = False
-        elif self.greater_is_better is None:
-            # Unnamed scalar custom metrics default to minimizing until a name is resolved.
-            self.greater_is_better = False
-
-    def _infer_greater_is_better(self, metric_name, task_type):
-        """Infer whether larger metric values indicate better models."""
-        del task_type
-        metric_name = metric_name.lower()
-        if any(loss_name in metric_name for loss_name in ["loss", "mse", "mae", "rmse", "error", "logloss", "log_loss"]):
-            return False
-        return True
-
-    def _infer_monitor_task_type(self, metric_name, default_task_id):
-        """Resolve the task type associated with the monitored metric."""
-        match = re.match(r"task_(\d+)_", metric_name)
-        if match:
-            task_id = int(match.group(1))
-            if 0 <= task_id < self.n_task:
-                return self.task_types[task_id]
-        return self.task_types[default_task_id]
-
     def _compute_default_task_losses(self, model, x_dict, ys, y_preds):
         """Compute the built-in per-task losses."""
         del model, x_dict
@@ -360,57 +334,6 @@ class MTLTrainer(object):
         """Return built-in metrics in the pre-hook task order."""
         return [metrics[name] for name in self._default_metric_keys()]
 
-    def _normalize_metrics(self, metrics, default_name):
-        """Normalize custom metric output to ``dict[str, float]``."""
-        if isinstance(metrics, dict):
-            normalized_metrics = {str(name): float(value) for name, value in metrics.items()}
-            self._resolve_custom_metric_configuration(normalized_metrics, scalar_output=False)
-            return normalized_metrics
-        metric_name = default_name or "metric"
-        normalized_metrics = {metric_name: float(metrics)}
-        self._resolve_custom_metric_configuration(normalized_metrics, scalar_output=True)
-        return normalized_metrics
-
-    def _resolve_custom_metric_configuration(self, metrics, scalar_output):
-        """Finalize monitor name and direction for custom metric outputs."""
-        if self.compute_metrics is None:
-            return
-        if self.metric_for_best_model is None:
-            if scalar_output:
-                self.metric_for_best_model = "metric"
-            else:
-                if len(metrics) == 1:
-                    self.metric_for_best_model = next(iter(metrics))
-                else:
-                    return
-        if self._should_infer_monitor_direction and self.metric_for_best_model is not None:
-            if scalar_output and self.metric_for_best_model == "metric":
-                self.greater_is_better = False
-            else:
-                monitor_task_type = self._infer_monitor_task_type(self.metric_for_best_model, self.earlystop_taskid)
-                self.greater_is_better = self._infer_greater_is_better(self.metric_for_best_model, monitor_task_type)
-            self._should_infer_monitor_direction = False
-            self._sync_early_stopper_mode()
-
-    def _sync_early_stopper_mode(self):
-        """Keep the early stopper aligned with the active monitor direction."""
-        if hasattr(self, "early_stopper"):
-            self.early_stopper.mode = "max" if self.greater_is_better else "min"
-
-    def _get_monitor_value(self, metrics):
-        """Extract the score tracked by early stopping and model selection."""
-        if self.metric_for_best_model is None:
-            raise ValueError(
-                "Custom compute_metrics returned multiple metrics. "
-                "Set metric_for_best_model to one of: "
-                f"{sorted(metrics.keys())}"
-            )
-        if self.metric_for_best_model not in metrics:
-            raise ValueError(
-                f"metric_for_best_model={self.metric_for_best_model!r} was not found in evaluation metrics: {sorted(metrics.keys())}"
-            )
-        return metrics[self.metric_for_best_model]
-
     def _default_metric_key(self, task_id):
         """Return the built-in metric key for a task."""
         return f"task_{task_id}_{self.default_metric_names[task_id]}"
@@ -433,7 +356,7 @@ class MTLTrainer(object):
                 predicts.extend(y_preds.tolist())
         targets, predicts = np.array(targets), np.array(predicts)
         if self.compute_metrics is not None:
-            return self._normalize_metrics(
+            return self._metric_monitor.normalize(
                 self.compute_metrics(targets, predicts),
                 default_name=self.metric_for_best_model,
             )
@@ -459,7 +382,7 @@ class MTLTrainer(object):
         if return_dict:
             return metrics
         if return_dict is False:
-            return self._get_monitor_value(metrics)
+            return self._metric_monitor.get_monitor_value(metrics)
         if self.compute_metrics is None:
             return self._legacy_default_scores(metrics)
         return metrics
