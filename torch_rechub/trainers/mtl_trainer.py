@@ -107,6 +107,7 @@ class MTLTrainer(object):
         self.task_loss_fns = [get_loss_func(task_type) for task_type in task_types]
         self.task_metric_fns = [get_metric_func(task_type) for task_type in task_types]
         self.default_metric_names = self._init_default_metric_names(task_types)
+        self._has_custom_loss_hook = compute_loss_func is not None
         self.compute_loss_func = compute_loss_func or self._compute_default_task_losses
         self.compute_metrics = compute_metrics
         self.metric_for_best_model = metric_for_best_model
@@ -328,7 +329,7 @@ class MTLTrainer(object):
     def _aggregate_loss(self, loss_list):
         """Aggregate task losses according to the configured MTL strategy."""
         base_model = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
-        if isinstance(base_model, ESMM):
+        if isinstance(base_model, ESMM) and not self._has_custom_loss_hook:
             # ESMM only computes loss for ctr and ctcvr tasks.
             return sum(loss_list[1:])
 

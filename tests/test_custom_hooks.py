@@ -7,7 +7,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from torch_rechub.basic.features import SparseFeature
 from torch_rechub.basic.callback import EarlyStopper
+from torch_rechub.models.multi_task import ESMM
 from torch_rechub.trainers import CTRTrainer, MTLTrainer, MatchTrainer
 
 
@@ -110,6 +112,14 @@ class ShortTaskLosses(object):
         return [F.binary_cross_entropy(y_preds[:, 0], y_preds[:, 0].detach())]
 
 
+class ESMMTaskLosses(object):
+    """Minimal three-task loss hook used to mark ESMM custom loss mode."""
+
+    def __call__(self, model, x_dict, ys, y_preds):
+        del model, x_dict, ys, y_preds
+        return [torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)]
+
+
 class RecordingLogger(object):
     """Capture trainer metric payloads for assertions."""
 
@@ -155,6 +165,18 @@ def build_mtl_dataloader():
     task_1 = (x > 0.3).float()
     y = torch.cat([task_0, task_1], dim=1)
     return DataLoader(DictDataset({"x": x}, y), batch_size=4, shuffle=False)
+
+
+def build_esmm_model():
+    """Create a minimal ESMM instance for aggregation tests."""
+    user_features = [SparseFeature("user", vocab_size=8, embed_dim=4)]
+    item_features = [SparseFeature("item", vocab_size=8, embed_dim=4)]
+    return ESMM(
+        user_features,
+        item_features,
+        cvr_params={"dims": [4]},
+        ctr_params={"dims": [4]},
+    )
 
 
 def binary_logloss_metrics(y_true, y_pred):
@@ -454,6 +476,53 @@ def test_mtl_trainer_validates_custom_task_loss_count():
 
         with pytest.raises(ValueError, match="must return 2 losses"):
             trainer.train_one_epoch(dataloader)
+
+
+def test_mtl_trainer_esmm_default_aggregation_keeps_legacy_objective():
+    """Built-in ESMM loss aggregation should keep ignoring task 0."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=build_esmm_model(),
+            task_types=["classification", "classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+        )
+
+        loss = trainer._aggregate_loss(
+            [
+                torch.tensor(1.0),
+                torch.tensor(2.0),
+                torch.tensor(3.0),
+            ]
+        )
+
+        assert loss.item() == pytest.approx(5.0)
+
+
+def test_mtl_trainer_esmm_custom_loss_aggregation_uses_all_tasks():
+    """Custom ESMM loss hooks should be able to override the full objective."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        trainer = MTLTrainer(
+            model=build_esmm_model(),
+            task_types=["classification", "classification", "classification"],
+            optimizer_params={"lr": 0.05},
+            n_epoch=1,
+            device="cpu",
+            model_path=temp_dir,
+            compute_loss_func=ESMMTaskLosses(),
+        )
+
+        loss = trainer._aggregate_loss(
+            [
+                torch.tensor(1.0),
+                torch.tensor(2.0),
+                torch.tensor(3.0),
+            ]
+        )
+
+        assert loss.item() == pytest.approx(2.0)
 
 
 def test_mtl_trainer_default_evaluate_returns_legacy_task_scores():
